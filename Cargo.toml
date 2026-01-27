@@ -10,3 +10,11 @@ evdev = "0.12"
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.10"
+
+[profile.dev]
+debug = 2
+split-debuginfo = "off"
+
+[profile.release]
+debug = 2
+split-debuginfo = "off"
