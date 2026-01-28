@@ -344,4 +344,35 @@ mod tests {
             .expect("鼠标点击失败");
         hid_device.mouse_scroll(5).expect("鼠标滚轮失败");
     }
+
+    #[test]
+    #[ignore]
+    fn test_led(){
+        let mut hid_device = UsbHidDevice::new().expect("创建 USB HID 设备失败");
+
+        println!("等待 USB 设备枚举...");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let mut i = 100;
+        loop {
+            i-=1;
+            
+            match hid_device.read_led_state() {
+                Ok(Some(led_state)) => {
+                    println!("LED 状态: {:?}", led_state);
+                }
+                Ok(None) => {
+                    // 无新状态
+                }
+                Err(e) => {
+                    eprintln!("读取 LED 状态失败: {}", e);
+                    break;
+                }
+            }
+            if i == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
 }
