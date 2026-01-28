@@ -94,8 +94,7 @@ impl MouseButtons {
 /// HID 设备通用接口
 ///
 /// 该 trait 定义了键盘和鼠标的通用操作，
-/// 可由 USB HID 或蓝牙 HID 实现。
-pub trait HidDevice {
+pub trait KeyboardHidDevice {
     // ========== 键盘操作 ==========
 
     /// 按下键盘按键
@@ -139,7 +138,9 @@ pub trait HidDevice {
 
     /// 读取 LED 状态（如大写锁定等）
     fn read_led_state(&self) -> Result<Option<LedState>>;
+}
 
+pub trait MouseHidDevice {
     // ========== 鼠标操作 ==========
 
     /// 移动鼠标（相对移动）
@@ -259,4 +260,5 @@ pub mod keycodes {
 }
 
 // 重新导出常用类型
-pub use usb::UsbHidDevice;
+pub use usb::UsbKeyboardHidDevice;
+pub use usb::UsbMouseHidDevice;
