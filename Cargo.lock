@@ -54,6 +54,7 @@ dependencies = [
  "anyhow",
  "env_logger",
  "evdev",
+ "libc",
  "log",
  "tokio",
  "usb-gadget",

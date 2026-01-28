@@ -10,6 +10,7 @@ evdev = "0.12"
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.10"
+libc = "0.2.180"
 
 [profile.dev]
 debug = 2

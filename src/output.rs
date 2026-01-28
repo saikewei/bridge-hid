@@ -46,6 +46,27 @@ impl KeyboardModifiers {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LedState {
+    pub num_lock: bool,
+    pub caps_lock: bool,
+    pub scroll_lock: bool,
+    pub compose: bool,
+    pub kana: bool,
+}
+
+impl LedState {
+    fn from_byte(byte: u8) -> Self {
+        Self {
+            num_lock: (byte & 0x01) != 0,
+            caps_lock: (byte & 0x02) != 0,
+            scroll_lock: (byte & 0x04) != 0,
+            compose: (byte & 0x08) != 0,
+            kana: (byte & 0x10) != 0,
+        }
+    }
+}
+
 /// 鼠标按钮
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MouseButtons {
@@ -115,6 +136,9 @@ pub trait HidDevice {
         }
         Ok(())
     }
+
+    /// 读取 LED 状态（如大写锁定等）
+    fn read_led_state(&self) -> Result<Option<LedState>>;
 
     // ========== 鼠标操作 ==========
 

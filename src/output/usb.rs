@@ -1,16 +1,19 @@
 use anyhow::{Result, anyhow};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use usb_gadget::{Class, Config, Gadget, Id, Strings, default_udc, function::hid::Hid};
 
-use super::{HidDevice, KeyboardModifiers, MouseButtons};
+use super::{HidDevice, KeyboardModifiers, MouseButtons, LedState};
 
 /// 键盘 HID 报告描述符
 const KEYBOARD_REPORT_DESC: &[u8] = &[
     0x05, 0x01, // Usage Page (Generic Desktop)
     0x09, 0x06, // Usage (Keyboard)
     0xA1, 0x01, // Collection (Application)
+    
+    // 修饰键 Input Report
     0x05, 0x07, //   Usage Page (Key Codes)
     0x19, 0xE0, //   Usage Minimum (224)
     0x29, 0xE7, //   Usage Maximum (231)
@@ -19,9 +22,24 @@ const KEYBOARD_REPORT_DESC: &[u8] = &[
     0x75, 0x01, //   Report Size (1)
     0x95, 0x08, //   Report Count (8)
     0x81, 0x02, //   Input (Data, Variable, Absolute) - Modifier byte
+    
+    // 保留字节
     0x95, 0x01, //   Report Count (1)
     0x75, 0x08, //   Report Size (8)
     0x81, 0x01, //   Input (Constant) - Reserved byte
+    
+    // LED Output Report (新增)
+    0x95, 0x05, //   Report Count (5) - 5个LED
+    0x75, 0x01, //   Report Size (1)
+    0x05, 0x08, //   Usage Page (LEDs)
+    0x19, 0x01, //   Usage Minimum (Num Lock)
+    0x29, 0x05, //   Usage Maximum (Kana)
+    0x91, 0x02, //   Output (Data, Variable, Absolute) - LED report
+    0x95, 0x01, //   Report Count (1)
+    0x75, 0x03, //   Report Size (3)
+    0x91, 0x01, //   Output (Constant) - LED padding
+    
+    // 按键数组
     0x95, 0x06, //   Report Count (6)
     0x75, 0x08, //   Report Size (8)
     0x15, 0x00, //   Logical Minimum (0)
@@ -30,6 +48,7 @@ const KEYBOARD_REPORT_DESC: &[u8] = &[
     0x19, 0x00, //   Usage Minimum (0)
     0x29, 0x65, //   Usage Maximum (101)
     0x81, 0x00, //   Input (Data, Array) - Key arrays (6 keys)
+    
     0xC0, // End Collection
 ];
 
@@ -131,6 +150,8 @@ impl UsbHidDevice {
 
         let keyboard_file = OpenOptions::new()
             .write(true)
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
             .open(&keyboard_path)
             .map_err(|e| anyhow!("打开键盘设备 {} 失败: {}", keyboard_path.display(), e))?;
 
@@ -218,6 +239,26 @@ impl HidDevice for UsbHidDevice {
         self.current_keys = [0u8; 6];
         self.current_modifiers = KeyboardModifiers::default();
         self.send_keyboard_report()
+    }
+
+    fn read_led_state(&self) -> Result<Option<LedState>> {
+        use std::io::Read;
+        
+        if let Some(ref file) = self.keyboard_file {
+            let mut buf = [0u8; 1];
+            match (&*file).read(&mut buf) {
+                Ok(1) => Ok(Some(LedState::from_byte(buf[0]))),
+                Ok(0) => Ok(None),
+                Ok(_) => {
+                    // 读取了超过预期的字节,这不应该发生
+                    Err(anyhow!("读取 LED 状态返回了意外的字节数"))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(anyhow!("读取 LED 状态失败: {}", e)),
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     fn mouse_move(&mut self, x: i8, y: i8) -> Result<()> {
