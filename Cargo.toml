@@ -11,6 +11,9 @@ anyhow = "1.0"
 log = "0.4"
 env_logger = "0.10"
 libc = "0.2.180"
+bluer = { version = "0.17", features = ["full"] }
+uuid = "1.0"
+futures = "0.3.31"
 
 [profile.dev]
 debug = 2
