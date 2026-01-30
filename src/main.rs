@@ -1,3 +1,4 @@
+mod input;
 mod output;
 
 fn main() {
