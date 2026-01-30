@@ -1,7 +1,9 @@
 pub mod bluetooth;
 pub mod usb;
 
+use crate::input::InputReport;
 use anyhow::Result;
+use async_trait::async_trait;
 
 /// 键盘修饰键
 #[derive(Debug, Clone, Copy, Default)]
@@ -47,7 +49,7 @@ impl KeyboardModifiers {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LedState {
     pub num_lock: bool,
     pub caps_lock: bool,
@@ -93,7 +95,16 @@ impl MouseButtons {
 }
 
 /// HID 设备通用接口
-///
+#[async_trait]
+pub trait HidBackend: Send + Sync {
+    /// 核心方法：直接发送解析好的报告枚举
+    async fn send_report(&mut self, report: InputReport) -> Result<()>;
+
+    async fn get_led_state(&mut self) -> Result<Option<LedState>> {
+        Ok(None)
+    }
+}
+
 /// 该 trait 定义了键盘和鼠标的通用操作，
 pub trait KeyboardHidDevice {
     // ========== 键盘操作 ==========

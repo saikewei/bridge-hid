@@ -1,10 +1,16 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Ok, Result, anyhow};
+use async_trait::async_trait;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::fs::File as TokioFile;
+use tokio::io::AsyncWriteExt;
 use usb_gadget::{Class, Config, Gadget, Id, Strings, default_udc, function::hid::Hid};
+
+use crate::output::HidBackend;
+use crate::output::InputReport;
 
 use super::{KeyboardHidDevice, KeyboardModifiers, LedState, MouseButtons, MouseHidDevice};
 
@@ -81,14 +87,14 @@ const MOUSE_REPORT_DESC: &[u8] = &[
 
 /// USB HID 键盘鼠标模拟器
 pub struct UsbKeyboardHidDevice {
-    keyboard_file: Option<File>,
+    keyboard_file: Option<tokio::fs::File>,
     _registration: Arc<usb_gadget::RegGadget>,
     current_keys: [u8; 6],
     current_modifiers: KeyboardModifiers,
 }
 
 pub struct UsbMouseHidDevice {
-    mouse_file: Option<File>,
+    mouse_file: Option<tokio::fs::File>,
     current_buttons: MouseButtons,
     _registration: Arc<usb_gadget::RegGadget>,
 }
@@ -149,17 +155,26 @@ pub fn build_usb_hid_device() -> Result<(UsbKeyboardHidDevice, UsbMouseHidDevice
     let keyboard_path = find_hidg_device(keyboard_dev.0, keyboard_dev.1)?;
     let mouse_path = find_hidg_device(mouse_dev.0, mouse_dev.1)?;
 
-    let keyboard_file = OpenOptions::new()
+    // 1. 打开标准库文件句柄
+    let std_file = OpenOptions::new()
         .write(true)
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        // .custom_flags(libc::O_NONBLOCK)
         .open(&keyboard_path)
         .map_err(|e| anyhow!("打开键盘设备 {} 失败: {}", keyboard_path.display(), e))?;
 
-    let mouse_file = OpenOptions::new()
+    // 2. 转换为异步句柄
+    let keyboard_file = TokioFile::from_std(std_file);
+
+    // 1. 打开标准库文件句柄
+    let std_file = OpenOptions::new()
         .write(true)
+        .read(true)
+        // .custom_flags(libc::O_NONBLOCK)
         .open(&mouse_path)
         .map_err(|e| anyhow!("打开鼠标设备 {} 失败: {}", mouse_path.display(), e))?;
+    // 2. 转换为异步句柄
+    let mouse_file = TokioFile::from_std(std_file);
 
     Ok((
         UsbKeyboardHidDevice {
@@ -176,95 +191,52 @@ pub fn build_usb_hid_device() -> Result<(UsbKeyboardHidDevice, UsbMouseHidDevice
     ))
 }
 
-impl UsbKeyboardHidDevice {
-    /// 发送键盘报告
-    fn send_keyboard_report(&mut self) -> Result<()> {
-        let report = [
-            self.current_modifiers.to_byte(),
-            0x00, // Reserved
-            self.current_keys[0],
-            self.current_keys[1],
-            self.current_keys[2],
-            self.current_keys[3],
-            self.current_keys[4],
-            self.current_keys[5],
-        ];
+#[async_trait]
+impl HidBackend for UsbKeyboardHidDevice {
+    async fn send_report(&mut self, report: InputReport) -> Result<()> {
+        match report {
+            InputReport::Keyboard { modifiers, keys } => {
+                // 1. 构造标准的 8 字节键盘报告
+                let mut data = [0u8; 8];
+                data[0] = modifiers; // 修饰键字节
+                data[1] = 0x00; // 保留字节
+
+                // 2. 填充按键 (最多支持 6 个同时按下的普通键)
+                for (i, &key) in keys.iter().take(6).enumerate() {
+                    data[i + 2] = key;
+                }
+
+                // 3. 异步写入到键盘设备文件
+                if let Some(ref mut file) = self.keyboard_file {
+                    file.write_all(&data)
+                        .await
+                        .map_err(|e| anyhow!("异步发送键盘报告失败: {}", e))?;
+                    file.flush().await?;
+                }
+            }
+            InputReport::Mouse { .. } => {
+                Err(anyhow!("收到鼠标报告,但当前后端仅支持键盘"))?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_led_state(&mut self) -> Result<Option<LedState>> {
+        use tokio::io::AsyncReadExt;
 
         if let Some(ref mut file) = self.keyboard_file {
-            file.write_all(&report)
-                .map_err(|e| anyhow!("发送键盘报告失败: {}", e))?;
-            file.flush()?;
-        }
-
-        Ok(())
-    }
-}
-
-impl UsbMouseHidDevice {
-    /// 发送鼠标报告
-    fn send_mouse_report(&mut self, x: i8, y: i8, wheel: i8) -> Result<()> {
-        let report = [
-            self.current_buttons.to_byte(),
-            x as u8,
-            y as u8,
-            wheel as u8,
-        ];
-
-        if let Some(ref mut file) = self.mouse_file {
-            file.write_all(&report)
-                .map_err(|e| anyhow!("发送鼠标报告失败: {}", e))?;
-            file.flush()?;
-        }
-        Ok(())
-    }
-}
-
-impl KeyboardHidDevice for UsbKeyboardHidDevice {
-    fn key_press(&mut self, keycode: u8) -> Result<()> {
-        for key in &mut self.current_keys {
-            if *key == 0 {
-                *key = keycode;
-                break;
-            }
-        }
-        self.send_keyboard_report()
-    }
-
-    fn key_release(&mut self, keycode: u8) -> Result<()> {
-        for key in &mut self.current_keys {
-            if *key == keycode {
-                *key = 0;
-                break;
-            }
-        }
-        self.send_keyboard_report()
-    }
-
-    fn set_modifiers(&mut self, modifiers: KeyboardModifiers) -> Result<()> {
-        self.current_modifiers = modifiers;
-        self.send_keyboard_report()
-    }
-
-    fn release_all_keys(&mut self) -> Result<()> {
-        self.current_keys = [0u8; 6];
-        self.current_modifiers = KeyboardModifiers::default();
-        self.send_keyboard_report()
-    }
-
-    fn read_led_state(&self) -> Result<Option<LedState>> {
-        use std::io::Read;
-
-        if let Some(ref file) = self.keyboard_file {
             let mut buf = [0u8; 1];
-            match (&*file).read(&mut buf) {
-                Ok(1) => Ok(Some(LedState::from_byte(buf[0]))),
-                Ok(0) => Ok(None),
-                Ok(_) => {
-                    // 读取了超过预期的字节,这不应该发生
-                    Err(anyhow!("读取 LED 状态返回了意外的字节数"))
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+
+            // 使用 .await 挂起任务，直到内核缓冲区有数据或返回错误
+            match file.read(&mut buf).await {
+                std::result::Result::Ok(1) => Ok(Some(LedState::from_byte(buf[0]))),
+                std::result::Result::Ok(0) => Ok(None), // EOF，通常表示设备关闭
+                // Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                //     // 如果是 O_NONBLOCK 模式且没数据，Tokio 有时会直接返回这个错误
+                //     Ok(None)
+                // }
                 Err(e) => Err(anyhow!("读取 LED 状态失败: {}", e)),
+                _ => Err(anyhow!("读取了意外的字节数")),
             }
         } else {
             Ok(None)
@@ -272,23 +244,37 @@ impl KeyboardHidDevice for UsbKeyboardHidDevice {
     }
 }
 
-impl MouseHidDevice for UsbMouseHidDevice {
-    fn mouse_move(&mut self, x: i8, y: i8) -> Result<()> {
-        self.send_mouse_report(x, y, 0)
-    }
+#[async_trait]
+impl HidBackend for UsbMouseHidDevice {
+    async fn send_report(&mut self, report: InputReport) -> Result<()> {
+        match report {
+            InputReport::Mouse {
+                buttons,
+                x,
+                y,
+                wheel,
+            } => {
+                // 1. 构造标准的 4 字节鼠标报告
+                let data = [
+                    buttons,     // 按钮状态字节
+                    x as u8,     // X 轴移动
+                    y as u8,     // Y 轴移动
+                    wheel as u8, // 滚轮移动
+                ];
+                // 2. 异步写入到鼠标设备文件
+                if let Some(ref mut file) = self.mouse_file {
+                    file.write_all(&data)
+                        .await
+                        .map_err(|e| anyhow!("异步发送鼠标报告失败: {}", e))?;
 
-    fn mouse_button_press(&mut self, buttons: MouseButtons) -> Result<()> {
-        self.current_buttons = buttons;
-        self.send_mouse_report(0, 0, 0)
-    }
-
-    fn mouse_button_release(&mut self) -> Result<()> {
-        self.current_buttons = MouseButtons::default();
-        self.send_mouse_report(0, 0, 0)
-    }
-
-    fn mouse_scroll(&mut self, delta: i8) -> Result<()> {
-        self.send_mouse_report(0, 0, delta)
+                    file.flush().await?;
+                }
+            }
+            InputReport::Keyboard { .. } => {
+                Err(anyhow!("收到键盘报告,但当前后端仅支持鼠标"))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -297,7 +283,7 @@ fn find_hidg_device(major: u32, minor: u32) -> Result<PathBuf> {
     for i in 0..10 {
         let path = PathBuf::from(format!("/dev/hidg{}", i));
         if path.exists() {
-            if let Ok(metadata) = std::fs::metadata(&path) {
+            if let std::result::Result::Ok(metadata) = std::fs::metadata(&path) {
                 use std::os::unix::fs::MetadataExt;
                 let dev = metadata.rdev();
                 let dev_major = ((dev >> 8) & 0xfff) as u32;
@@ -316,9 +302,9 @@ mod tests {
     use super::*;
     use crate::output::keycodes;
 
-    #[test]
+    #[tokio::test]
     #[ignore]
-    fn test_hid() {
+    async fn test_hid() {
         let (mut kb_hid_device, mut mouse_hid_device) =
             build_usb_hid_device().expect("创建 USB HID 设备失败");
 
@@ -335,9 +321,23 @@ mod tests {
 
         for (i, key) in keys.iter().enumerate() {
             println!("发送按键 {}/{}...", i + 1, keys.len());
-            if let Err(e) = kb_hid_device.key_tap(*key) {
-                eprintln!("按键失败: {}", e);
-                break;
+            if let Err(e) = kb_hid_device
+                .send_report(InputReport::Keyboard {
+                    modifiers: 0,
+                    keys: vec![*key],
+                })
+                .await
+            {
+                eprintln!("释放按键失败: {:?}", e);
+            }
+            if let Err(e) = kb_hid_device
+                .send_report(InputReport::Keyboard {
+                    modifiers: 0,
+                    keys: vec![],
+                })
+                .await
+            {
+                eprintln!("释放按键失败: {:?}", e);
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
@@ -345,47 +345,72 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_secs(1));
         println!("移动鼠标...");
         for _ in 0..50 {
-            mouse_hid_device.mouse_move(0, -5).expect("移动鼠标失败");
+            mouse_hid_device
+                .send_report(InputReport::Mouse {
+                    buttons: 0,
+                    x: 0,
+                    y: -5,
+                    wheel: 0,
+                })
+                .await
+                .expect("移动鼠标失败");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         mouse_hid_device
-            .mouse_click(MouseButtons {
-                left: true,
-                right: false,
-                middle: false,
+            .send_report(InputReport::Mouse {
+                buttons: 0x01,
+                x: 0,
+                y: 0,
+                wheel: 0,
             })
+            .await
             .expect("鼠标点击失败");
-        mouse_hid_device.mouse_scroll(5).expect("鼠标滚轮失败");
+        for _ in 0..50 {
+            mouse_hid_device
+                .send_report(InputReport::Mouse {
+                    buttons: 0,
+                    x: 0,
+                    y: 0,
+                    wheel: 1,
+                })
+                .await
+                .expect("滚动鼠标失败");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore]
-    fn test_led() {
-        let (kb_hid_device, _) = build_usb_hid_device().expect("创建 USB HID 设备失败");
+    async fn test_led() {
+        let (mut kb_hid_device, _) = build_usb_hid_device().expect("创建 USB HID 设备失败");
 
         println!("等待 USB 设备枚举...");
         std::thread::sleep(std::time::Duration::from_secs(2));
 
-        let mut i = 100;
-        loop {
-            i -= 1;
+        // 1. 初始化一个“上一次状态”的缓存
+        let mut last_led_state: Option<LedState> = None;
 
-            match kb_hid_device.read_led_state() {
-                Ok(Some(led_state)) => {
-                    println!("LED 状态: {:?}", led_state);
+        println!("等待 LED 状态变化...");
+        loop {
+            match kb_hid_device.get_led_state().await {
+                std::result::Result::Ok(Some(new_state)) => {
+                    // 2. 只有新旧状态不同，才打印并执行逻辑
+                    if Some(new_state) != last_led_state {
+                        println!("LED 状态发生变更: {:?}", new_state);
+
+                        // 3. 更新缓存
+                        last_led_state = Some(new_state);
+
+                        // 在这里执行你真正的同步逻辑，例如同步给物理键盘
+                        // self.input_manager.set_all_leds(new_state);
+                    }
                 }
-                Ok(None) => {
-                    // 无新状态
-                }
+                std::result::Result::Ok(None) => {}
                 Err(e) => {
-                    eprintln!("读取 LED 状态失败: {}", e);
+                    eprintln!("读取失败: {}", e);
                     break;
                 }
             }
-            if i == 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
 }
