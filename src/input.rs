@@ -4,7 +4,9 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
@@ -27,8 +29,23 @@ pub enum DeviceType {
     Mouse,
 }
 
+static SYN_COUNT: AtomicU64 = AtomicU64::new(0);
+static SYN_LAST: OnceLock<Mutex<Instant>> = OnceLock::new();
+
+fn record_syn_rate() {
+    SYN_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    let lock = SYN_LAST.get_or_init(|| Mutex::new(Instant::now()));
+    let mut last = lock.lock().unwrap();
+
+    if last.elapsed() >= Duration::from_secs(1) {
+        let count = SYN_COUNT.swap(0, Ordering::Relaxed);
+        println!("SYN_REPORT rate = {}", count);
+        *last = Instant::now();
+    }
+}
+
 struct DeviceMonitor {
-    device: Device,
     device_type: DeviceType,
     keyboard_state: KeyboardState,
     mouse_state: MouseState,
@@ -46,6 +63,7 @@ struct MouseState {
     x_delta: i16,
     y_delta: i16,
     wheel_delta: i8,
+    dirty: bool,
 }
 
 pub struct InputManager {
@@ -146,14 +164,13 @@ impl InputManager {
 
                                     tokio::spawn(async move {
                                         let monitor = DeviceMonitor {
-                                            device,
                                             device_type,
                                             keyboard_state: KeyboardState::default(),
                                             mouse_state: MouseState::default(),
                                         };
 
                                         println!("Started monitoring: {}", path_id);
-                                        monitor.run(tx_clone, led_rx_to_pass).await;
+                                        monitor.run(tx_clone, led_rx_to_pass, device).await;
 
                                         // 线程退出（报错或断开）后清理占位符
                                         active_monitors_clone.lock().unwrap().remove(&path_id);
@@ -198,10 +215,10 @@ impl DeviceMonitor {
         mut self,
         tx: mpsc::UnboundedSender<InputReport>,
         mut led_rx: Option<mpsc::UnboundedReceiver<LedState>>,
+        mut device: Device,
     ) {
         let mut led_handle = None;
-        let device_name = self
-            .device
+        let device_name = device
             .name()
             .map(|n| n.to_string())
             .unwrap_or_else(|| "Unknown".to_string());
@@ -209,7 +226,7 @@ impl DeviceMonitor {
         // 只有当设备类型是键盘时，才启用 LED 控制逻辑和 FD 克隆
         if self.device_type == DeviceType::Keyboard {
             // 1. 获取底层的系统文件描述符 (Raw FD)
-            let raw_fd = self.device.as_raw_fd();
+            let raw_fd = device.as_raw_fd();
 
             // 2. 使用系统调用 dup 克隆描述符
             let cloned_fd = unsafe { libc::dup(raw_fd) };
@@ -270,22 +287,12 @@ impl DeviceMonitor {
             }
         }
 
-        // 任务二：阻塞读取任务 (无论是键盘还是鼠标都需要运行)
-        let fetch_handle = tokio::task::spawn_blocking(move || {
-            loop {
-                let events: Vec<_> = match self.device.fetch_events() {
-                    Ok(events) => events.collect(),
-                    Err(e) => {
-                        println!("Device {} disconnected: {:?}", device_name, e);
-                        return;
-                    }
-                };
-                for event in events {
-                    if let Some(report) = self.process_event(event) {
-                        if tx.send(report).is_err() {
-                            return;
-                        }
-                    }
+        // 任务二：读取任务 (无论是键盘还是鼠标都需要运行)
+        let fetch_handle = tokio::spawn(async move {
+            let mut stream = device.into_event_stream().expect("无法获取事件流");
+            while let event = stream.next_event().await.expect("获取事件失败") {
+                if let Some(report) = self.process_event(event) {
+                    tx.send(report);
                 }
             }
         });
@@ -304,6 +311,7 @@ impl DeviceMonitor {
             _ = fetch_handle => {
                 // 读取任务结束（通常是拔掉设备），select 会随之退出，整个 run 函数结束
             },
+
         };
     }
 
@@ -406,10 +414,12 @@ impl DeviceMonitor {
 
     fn process_mouse_event(&mut self, event: evdev::InputEvent) -> Option<InputReport> {
         let axis = evdev::RelativeAxisCode(event.code());
+
         match event.event_type() {
             EventType::KEY => {
                 let key = KeyCode::new(event.code());
                 let is_pressed = event.value() == 1;
+
                 match key {
                     KeyCode::BTN_LEFT => {
                         if is_pressed {
@@ -432,34 +442,57 @@ impl DeviceMonitor {
                             self.mouse_state.buttons &= !0x04;
                         }
                     }
-                    _ => {}
+                    _ => return None,
                 }
+                // 按钮变化需要标记，但也等 SYN_REPORT 一起发
+                self.mouse_state.dirty = true;
             }
-            EventType::RELATIVE => match axis {
-                evdev::RelativeAxisCode::REL_HWHEEL => {
-                    self.mouse_state.x_delta = event.value() as i16
+
+            EventType::RELATIVE => {
+                match axis {
+                    evdev::RelativeAxisCode::REL_X => {
+                        self.mouse_state.x_delta += event.value() as i16;
+                    }
+                    evdev::RelativeAxisCode::REL_Y => {
+                        self.mouse_state.y_delta += event.value() as i16;
+                    }
+                    evdev::RelativeAxisCode::REL_WHEEL => {
+                        self.mouse_state.wheel_delta += event.value() as i8;
+                    }
+                    _ => return None,
                 }
-                evdev::RelativeAxisCode::REL_Y => self.mouse_state.y_delta = event.value() as i16,
-                evdev::RelativeAxisCode::REL_WHEEL => {
-                    self.mouse_state.wheel_delta = event.value() as i8
-                }
-                _ => {}
-            },
+                self.mouse_state.dirty = true;
+            }
+
+            // 只在 SYN_REPORT 时发送完整报告
             EventType::SYNCHRONIZATION => {
-                let report = InputReport::Mouse {
-                    buttons: self.mouse_state.buttons,
-                    x: self.mouse_state.x_delta,
-                    y: self.mouse_state.y_delta,
-                    wheel: self.mouse_state.wheel_delta,
-                };
-                self.mouse_state.x_delta = 0;
-                self.mouse_state.y_delta = 0;
-                self.mouse_state.wheel_delta = 0;
-                return Some(report);
+                if self.mouse_state.dirty {
+                    // record_syn_rate();
+                    self.mouse_state.dirty = false;
+                    return Some(self.build_mouse_report());
+                }
             }
+
             _ => {}
         }
+
         None
+    }
+
+    fn build_mouse_report(&mut self) -> InputReport {
+        let report = InputReport::Mouse {
+            buttons: self.mouse_state.buttons,
+            x: self.mouse_state.x_delta,
+            y: self.mouse_state.y_delta,
+            wheel: self.mouse_state.wheel_delta,
+        };
+
+        // ⭐发完立刻清空 delta
+        self.mouse_state.x_delta = 0;
+        self.mouse_state.y_delta = 0;
+        self.mouse_state.wheel_delta = 0;
+
+        report
     }
 }
 
