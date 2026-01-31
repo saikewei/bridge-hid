@@ -31,6 +31,7 @@ pub enum DeviceType {
 
 static SYN_COUNT: AtomicU64 = AtomicU64::new(0);
 static SYN_LAST: OnceLock<Mutex<Instant>> = OnceLock::new();
+static LAST_CALL: OnceLock<Mutex<Instant>> = OnceLock::new();
 
 fn record_syn_rate() {
     SYN_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -42,6 +43,27 @@ fn record_syn_rate() {
         let count = SYN_COUNT.swap(0, Ordering::Relaxed);
         println!("SYN_REPORT rate = {}", count);
         *last = Instant::now();
+    }
+}
+
+fn elapsed_since_last_call_ms() {
+    // 第一次调用时初始化
+    let lock = LAST_CALL.get_or_init(|| Mutex::new(Instant::now()));
+
+    // 获取锁
+    let mut last = lock.lock().unwrap();
+
+    // 计算距离上次调用的时间
+    let elapsed = last.elapsed().as_millis();
+
+    // 更新为当前时间
+    *last = Instant::now();
+
+    if elapsed > 20 {
+        println!(
+            "Warning: Long delay between SYN_REPORT events: {} ms",
+            elapsed
+        );
     }
 }
 
@@ -468,6 +490,7 @@ impl DeviceMonitor {
             EventType::SYNCHRONIZATION => {
                 if self.mouse_state.dirty {
                     // record_syn_rate();
+                    // elapsed_since_last_call_ms();
                     self.mouse_state.dirty = false;
                     return Some(self.build_mouse_report());
                 }
