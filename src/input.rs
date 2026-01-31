@@ -59,7 +59,7 @@ fn elapsed_since_last_call_ms() {
     // 更新为当前时间
     *last = Instant::now();
 
-    if elapsed > 20 {
+    if elapsed > 10 {
         println!(
             "Warning: Long delay between SYN_REPORT events: {} ms",
             elapsed
@@ -310,11 +310,22 @@ impl DeviceMonitor {
         }
 
         // 任务二：读取任务 (无论是键盘还是鼠标都需要运行)
-        let fetch_handle = tokio::spawn(async move {
-            let mut stream = device.into_event_stream().expect("无法获取事件流");
-            while let event = stream.next_event().await.expect("获取事件失败") {
-                if let Some(report) = self.process_event(event) {
-                    tx.send(report);
+        let fetch_handle = tokio::task::spawn_blocking(move || {
+            loop {
+                match device.fetch_events() {
+                    Ok(events) => {
+                        for event in events {
+                            if let Some(report) = self.process_event(event) {
+                                if tx.send(report).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("读取事件失败: {}", e);
+                        return;
+                    }
                 }
             }
         });

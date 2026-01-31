@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn test_usb_input_output() {
     println!("Starting USB input-output test...");
