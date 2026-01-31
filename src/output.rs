@@ -96,13 +96,15 @@ impl MouseButtons {
 
 /// HID 设备通用接口
 #[async_trait]
-pub trait HidBackend: Send + Sync {
+pub trait HidReportSender: Send + Sync {
     /// 核心方法：直接发送解析好的报告枚举
     async fn send_report(&mut self, report: InputReport) -> Result<()>;
+}
 
-    async fn get_led_state(&mut self) -> Result<Option<LedState>> {
-        Ok(None)
-    }
+#[async_trait]
+pub trait HidLedReader: Send + Sync {
+    /// 核心方法：读取 LED 状态字节
+    async fn get_led_state(&mut self) -> Result<Option<LedState>>;
 }
 
 /// 该 trait 定义了键盘和鼠标的通用操作，

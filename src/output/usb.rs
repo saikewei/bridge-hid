@@ -9,8 +9,8 @@ use tokio::fs::File as TokioFile;
 use tokio::io::AsyncWriteExt;
 use usb_gadget::{Class, Config, Gadget, Id, Strings, default_udc, function::hid::Hid};
 
-use crate::output::HidBackend;
 use crate::output::InputReport;
+use crate::output::{HidLedReader, HidReportSender};
 
 use super::{KeyboardHidDevice, KeyboardModifiers, LedState, MouseButtons, MouseHidDevice};
 
@@ -87,18 +87,21 @@ const MOUSE_REPORT_DESC: &[u8] = &[
 
 /// USB HID 键盘鼠标模拟器
 pub struct UsbKeyboardHidDevice {
-    keyboard_file: Option<std::fs::File>,
+    keyboard_file: Option<tokio::fs::File>,
     _registration: Arc<usb_gadget::RegGadget>,
-    current_modifiers: KeyboardModifiers,
 }
 
 pub struct UsbMouseHidDevice {
-    mouse_file: Option<std::fs::File>,
+    mouse_file: Option<tokio::fs::File>,
     _registration: Arc<usb_gadget::RegGadget>,
 }
 
 /// 创建并初始化 USB HID 设备
-pub fn build_usb_hid_device() -> Result<(UsbKeyboardHidDevice, UsbMouseHidDevice)> {
+pub async fn build_usb_hid_device() -> Result<(
+    UsbKeyboardHidDevice,
+    UsbKeyboardHidDevice,
+    UsbMouseHidDevice,
+)> {
     usb_gadget::remove_all().map_err(|e| anyhow!("无法移除现有 gadgets: {}", e))?;
 
     // 创建键盘 HID 功能
@@ -161,6 +164,12 @@ pub fn build_usb_hid_device() -> Result<(UsbKeyboardHidDevice, UsbMouseHidDevice
         .open(&keyboard_path)
         .map_err(|e| anyhow!("打开键盘设备 {} 失败: {}", keyboard_path.display(), e))?;
 
+    let keyboard_file_tokio = TokioFile::from_std(keyboard_file);
+    let keyboard_file_tokio_clone = keyboard_file_tokio
+        .try_clone()
+        .await
+        .map_err(|e| anyhow!("克隆键盘文件句柄失败: {}", e))?;
+
     // 1. 打开标准库文件句柄
     let mouse_file = OpenOptions::new()
         .write(true)
@@ -169,21 +178,26 @@ pub fn build_usb_hid_device() -> Result<(UsbKeyboardHidDevice, UsbMouseHidDevice
         .open(&mouse_path)
         .map_err(|e| anyhow!("打开鼠标设备 {} 失败: {}", mouse_path.display(), e))?;
 
+    let mouse_file_tokio = TokioFile::from_std(mouse_file);
+
     Ok((
         UsbKeyboardHidDevice {
-            keyboard_file: Some(keyboard_file),
+            keyboard_file: Some(keyboard_file_tokio),
             _registration: Arc::clone(&shared_reg),
-            current_modifiers: KeyboardModifiers::default(),
+        },
+        UsbKeyboardHidDevice {
+            keyboard_file: Some(keyboard_file_tokio_clone),
+            _registration: Arc::clone(&shared_reg),
         },
         UsbMouseHidDevice {
-            mouse_file: Some(mouse_file),
+            mouse_file: Some(mouse_file_tokio),
             _registration: Arc::clone(&shared_reg),
         },
     ))
 }
 
 #[async_trait]
-impl HidBackend for UsbKeyboardHidDevice {
+impl HidReportSender for UsbKeyboardHidDevice {
     async fn send_report(&mut self, report: InputReport) -> Result<()> {
         match report {
             InputReport::Keyboard { modifiers, keys } => {
@@ -200,6 +214,7 @@ impl HidBackend for UsbKeyboardHidDevice {
                 // 3. 异步写入到键盘设备文件
                 if let Some(ref mut file) = self.keyboard_file {
                     file.write_all(&data)
+                        .await
                         .map_err(|e| anyhow!("异步发送键盘报告失败: {}", e))?;
                     // file.flush().await?;
                 }
@@ -210,15 +225,18 @@ impl HidBackend for UsbKeyboardHidDevice {
         }
         Ok(())
     }
+}
 
+#[async_trait]
+impl HidLedReader for UsbKeyboardHidDevice {
     async fn get_led_state(&mut self) -> Result<Option<LedState>> {
-        // use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncReadExt;
 
         if let Some(ref mut file) = self.keyboard_file {
             let mut buf = [0u8; 1];
 
             // 使用 .await 挂起任务，直到内核缓冲区有数据或返回错误
-            match file.read(&mut buf) {
+            match file.read(&mut buf).await {
                 std::result::Result::Ok(1) => Ok(Some(LedState::from_byte(buf[0]))),
                 std::result::Result::Ok(0) => Ok(None), // EOF，通常表示设备关闭
                 // Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -235,7 +253,7 @@ impl HidBackend for UsbKeyboardHidDevice {
 }
 
 #[async_trait]
-impl HidBackend for UsbMouseHidDevice {
+impl HidReportSender for UsbMouseHidDevice {
     async fn send_report(&mut self, report: InputReport) -> Result<()> {
         match report {
             InputReport::Mouse {
@@ -254,6 +272,7 @@ impl HidBackend for UsbMouseHidDevice {
                 // 2. 异步写入到鼠标设备文件
                 if let Some(ref mut file) = self.mouse_file {
                     file.write_all(&data)
+                        .await
                         .map_err(|e| anyhow!("异步发送鼠标报告失败: {}", e))?;
 
                     // file.flush().await?;
@@ -294,8 +313,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_hid() {
-        let (mut kb_hid_device, mut mouse_hid_device) =
-            build_usb_hid_device().expect("创建 USB HID 设备失败");
+        let (mut kb_hid_device, _, mut mouse_hid_device) =
+            build_usb_hid_device().await.expect("创建 USB HID 设备失败");
 
         println!("等待 USB 设备枚举...");
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -371,7 +390,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_led() {
-        let (mut kb_hid_device, _) = build_usb_hid_device().expect("创建 USB HID 设备失败");
+        let (mut kb_hid_device, _, _) =
+            build_usb_hid_device().await.expect("创建 USB HID 设备失败");
 
         println!("等待 USB 设备枚举...");
         std::thread::sleep(std::time::Duration::from_secs(2));
