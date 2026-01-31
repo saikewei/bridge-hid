@@ -1,5 +1,5 @@
-mod input;
-mod output;
+use bridge_hid::input;
+use bridge_hid::output;
 
 fn main() {
     println!("Hello, world!");
