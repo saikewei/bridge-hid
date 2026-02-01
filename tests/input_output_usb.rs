@@ -20,7 +20,7 @@ async fn test_usb_input_output() {
 
     // std::thread::sleep(std::time::Duration::from_secs(2));
 
-    let main_hanle = tokio::spawn(async move {
+    let main_handle = tokio::spawn(async move {
         loop {
             if let Some(event) = manager.next_event().await {
                 match event {
@@ -59,7 +59,7 @@ async fn test_usb_input_output() {
     });
 
     tokio::select! {
-        _ = main_hanle => {},
+        _ = main_handle => {},
         _ = led_handle => {},
     }
 }
