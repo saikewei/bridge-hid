@@ -47,6 +47,19 @@ impl KeyboardModifiers {
         }
         byte
     }
+
+    pub fn from_bits_truncate(byte: u8) -> Self {
+        Self {
+            left_ctrl: (byte & 0x01) != 0,
+            left_shift: (byte & 0x02) != 0,
+            left_alt: (byte & 0x04) != 0,
+            left_gui: (byte & 0x08) != 0,
+            right_ctrl: (byte & 0x10) != 0,
+            right_shift: (byte & 0x20) != 0,
+            right_alt: (byte & 0x40) != 0,
+            right_gui: (byte & 0x80) != 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -91,6 +104,14 @@ impl MouseButtons {
             byte |= 0x04;
         }
         byte
+    }
+
+    pub fn from_bits_truncate(byte: u8) -> Self {
+        Self {
+            left: (byte & 0x01) != 0,
+            right: (byte & 0x02) != 0,
+            middle: (byte & 0x04) != 0,
+        }
     }
 }
 

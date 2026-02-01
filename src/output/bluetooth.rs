@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 use bluer::agent::Agent;
 use bluer::l2cap::{SocketAddr, StreamListener};
 use bluer::rfcomm::{Profile, ProfileHandle, Role};
@@ -9,7 +10,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::{KeyboardHidDevice, KeyboardModifiers, LedState, MouseButtons, MouseHidDevice};
+use super::{
+    HidLedReader, HidReportSender, InputReport, KeyboardHidDevice, KeyboardModifiers, LedState,
+    MouseButtons, MouseHidDevice,
+};
 
 const PSM_HID_CONTROL: u16 = 0x0011; // 17
 const PSM_HID_INTERRUPT: u16 = 0x0013; // 19
@@ -97,7 +101,7 @@ const KEYBOARD_SDP_RECORD: &str = r#"
     <sequence>
       <sequence>
         <uint8 value="0x22" />
-        <text encoding="hex" value="05010906a1018501050719e029e71500250175019508810295017508810195057501050819012905910295017503910195067508150025650507190029658100c005010902a10185020901a100050919012903150025019503750181029501750581030501093009311581257f750895028106c0c0" />
+        <text encoding="hex" value="05010906a1018501050719e029e71500250175019508810295017508810195057501050819012905910295017503910195067508150025650507190029658100c005010902a10185020901a100050919012903150025019503750181029505750181010501093009311581257f750895028106c0c0" />
       </sequence>
     </sequence>
   </attribute>
@@ -303,118 +307,73 @@ pub async fn run_server(
     Ok(())
 }
 
-impl BluetoothKeyboardHidDevice {
+#[async_trait]
+impl HidReportSender for BluetoothKeyboardHidDevice {
     /// 发送键盘报告
-    async fn send_keyboard_report(&self) -> Result<()> {
-        let report = [
-            0xA1,
-            0x01, // Report ID
-            self.current_modifiers.to_byte(),
-            0x00, // Reserved
-            self.current_keys[0],
-            self.current_keys[1],
-            self.current_keys[2],
-            self.current_keys[3],
-            self.current_keys[4],
-            self.current_keys[5],
-        ];
+    async fn send_report(&mut self, report: InputReport) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
 
-        let mut socket = self.interrupt_socket.lock().await;
-        if let Some(ref mut sock) = *socket {
-            use tokio::io::AsyncWriteExt;
-            sock.write_all(&report).await?;
-            sock.flush().await?;
-        } else {
-            return Err(anyhow!("蓝牙 HID 未连接"));
+        if let InputReport::Keyboard { modifiers, keys } = report {
+            let mut socket_guard = self.interrupt_socket.lock().await;
+            if let Some(ref mut sock) = *socket_guard {
+                // HID键盘报告格式: [Header, ReportID, Modifiers, Reserved, Key1-Key6]
+                let mut hid_report = [
+                    0xA1u8, 0x01, modifiers, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                ];
+
+                // 填充按键数组 (最多6个按键)
+                for (i, &key) in keys.iter().take(6).enumerate() {
+                    hid_report[4 + i] = key;
+                }
+
+                sock.write_all(&hid_report).await?;
+                sock.flush().await?;
+
+                self.current_modifiers = KeyboardModifiers::from_bits_truncate(modifiers);
+                self.current_keys.copy_from_slice(&hid_report[4..10]);
+            }
         }
 
         Ok(())
     }
 }
 
-impl BluetoothMouseHidDevice {
+#[async_trait]
+impl HidReportSender for BluetoothMouseHidDevice {
     /// 发送鼠标报告
-    async fn send_mouse_report(&self, x: i8, y: i8, wheel: i8) -> Result<()> {
-        let report = [
-            0xA1,
-            0x02, // Report ID
-            self.current_buttons.to_byte(),
-            x as u8,
-            y as u8,
-            wheel as u8,
-        ];
-        let mut socket = self.interrupt_socket.lock().await;
-        if let Some(ref mut sock) = *socket {
-            use tokio::io::AsyncWriteExt;
-            sock.write_all(&report).await?;
-            sock.flush().await?;
-        } else {
-            return Err(anyhow!("蓝牙 HID 未连接"));
+    async fn send_report(&mut self, report: InputReport) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        if let InputReport::Mouse {
+            buttons,
+            x,
+            y,
+            wheel,
+        } = report
+        {
+            let mut socket_guard = self.interrupt_socket.lock().await;
+            if let Some(ref mut sock) = *socket_guard {
+                // HID鼠标报告格式: [Header, ReportID, Buttons, X_low, X_high, Y_low, Y_high, Wheel]
+                // 匹配 HID 描述符: 按钮(3bit) + X(12bit) + Y(12bit) + Wheel(8bit)
+                let hid_report = [
+                    0xA1,                    // HID Data | Input Report
+                    0x02,                    // Report ID (鼠标)
+                    buttons,                 // 按钮状态 (Bit 0-2: 左中右, Bit 3-7: 其他)
+                    (x & 0xFF) as u8,        // X低字节
+                    ((x >> 8) & 0x0F) as u8, // X高4位
+                    (y & 0xFF) as u8,        // Y低字节
+                    ((y >> 8) & 0x0F) as u8, // Y高4位
+                    wheel as u8,             // 滚轮 (有符号8位)
+                ];
+
+                sock.write_all(&hid_report).await?;
+                sock.flush().await?;
+
+                self.current_buttons = MouseButtons::from_bits_truncate(buttons);
+            }
         }
 
         Ok(())
-    }
-}
-
-// 为了实现同步 trait,我们需要使用 tokio runtime
-impl KeyboardHidDevice for BluetoothKeyboardHidDevice {
-    fn key_press(&mut self, keycode: u8) -> Result<()> {
-        for key in &mut self.current_keys {
-            if *key == 0 {
-                *key = keycode;
-                break;
-            }
-        }
-
-        tokio::runtime::Handle::current().block_on(self.send_keyboard_report())
-    }
-
-    fn key_release(&mut self, keycode: u8) -> Result<()> {
-        for key in &mut self.current_keys {
-            if *key == keycode {
-                *key = 0;
-                break;
-            }
-        }
-
-        tokio::runtime::Handle::current().block_on(self.send_keyboard_report())
-    }
-
-    fn set_modifiers(&mut self, modifiers: KeyboardModifiers) -> Result<()> {
-        self.current_modifiers = modifiers;
-        tokio::runtime::Handle::current().block_on(self.send_keyboard_report())
-    }
-
-    fn release_all_keys(&mut self) -> Result<()> {
-        self.current_keys = [0u8; 6];
-        self.current_modifiers = KeyboardModifiers::default();
-        tokio::runtime::Handle::current().block_on(self.send_keyboard_report())
-    }
-
-    fn read_led_state(&self) -> Result<Option<LedState>> {
-        // 蓝牙 HID LED 状态需要通过控制通道接收
-        // 这里简化实现,返回 None
-        Ok(None)
-    }
-}
-
-impl MouseHidDevice for BluetoothMouseHidDevice {
-    fn mouse_move(&mut self, x: i8, y: i8) -> Result<()> {
-        tokio::runtime::Handle::current().block_on(self.send_mouse_report(x, y, 0))
-    }
-
-    fn mouse_button_press(&mut self, buttons: MouseButtons) -> Result<()> {
-        self.current_buttons = buttons;
-        tokio::runtime::Handle::current().block_on(self.send_mouse_report(0, 0, 0))
-    }
-
-    fn mouse_button_release(&mut self) -> Result<()> {
-        self.current_buttons = MouseButtons::default();
-        tokio::runtime::Handle::current().block_on(self.send_mouse_report(0, 0, 0))
-    }
-
-    fn mouse_scroll(&mut self, delta: i8) -> Result<()> {
-        tokio::runtime::Handle::current().block_on(self.send_mouse_report(0, 0, delta))
     }
 }
 
@@ -422,74 +381,66 @@ impl MouseHidDevice for BluetoothMouseHidDevice {
 mod tests {
     use super::*;
     use crate::output::keycodes;
-    use std::time::Duration; // 假设你的键码定义在 output 模块
+    use std::time::Duration;
 
     #[tokio::test]
     #[ignore]
     async fn test_bluetooth_connection() -> Result<()> {
-        // // 初始化日志，方便查看输出
-        // env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-        // // 1. 初始化适配器
-        // let (mut keyboard, _mouse, _session) = build_bluetooth_hid_device().await?;
+        let (keyboard, _mouse, session) = build_bluetooth_hid_device().await?;
 
-        // // 2. 在后台运行服务器逻辑
-        // // 我们使用 tokio::spawn 因为监听是阻塞/长期的
-        // let kbd_arc = Arc::new(keyboard);
-        // let kbd_clone = kbd_arc.clone();
+        // 使用 Arc 包装以便在多个任务间共享
+        let keyboard = Arc::new(Mutex::new(keyboard));
+        let keyboard_clone = Arc::clone(&keyboard);
 
-        // tokio::spawn(async move {
-        //     if let Err(e) = kbd_clone.run_server().await {
-        //         eprintln!("服务器运行出错: {}", e);
-        //     }
-        // });
+        // 启动服务器
+        tokio::spawn(async move {
+            let kbd = keyboard_clone.lock().await;
+            if let Err(e) = run_server(&kbd, &session).await {
+                eprintln!("服务器运行出错: {}", e);
+            }
+        });
 
-        // println!("--------------------------------------------------");
-        // println!("测试模式已启动！");
-        // println!("请在 iPad 的蓝牙设置中搜索并点击 'Virtual Keyboard Mouse'");
-        // println!("你有 60 秒时间完成配对和测试...");
-        // println!("--------------------------------------------------");
+        println!("--------------------------------------------------");
+        println!("测试模式已启动！");
+        println!("请在 iPad 的蓝牙设置中搜索并点击 'Virtual Keyboard Mouse'");
+        println!("你有 60 秒时间完成配对和测试...");
+        println!("--------------------------------------------------");
 
-        // // 3. 循环检查连接状态，一旦连接成功就发送一个 'A'
-        // for i in 0..600 {
-        //     tokio::time::sleep(Duration::from_secs(1)).await;
+        // 等待连接
+        for i in 0..600 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
 
-        //     let is_connected = kbd_arc.interrupt_socket.lock().await.is_some();
-        //     if is_connected {
-        //         println!("检测到连接！发送一次按键 'A'...");
+            let mut kbd = keyboard.lock().await;
+            let is_connected = kbd.interrupt_socket.lock().await.is_some();
 
-        //         let mut socket_guard = kbd_arc.interrupt_socket.lock().await;
-        //         if let Some(ref mut sock) = *socket_guard {
-        //             use tokio::io::AsyncWriteExt;
+            if is_connected {
+                println!("检测到连接！发送一次按键 'A'...");
 
-        //             // --- 1. 发送按下 'A' (Usage ID 为 0x04) ---
-        //             // 格式: [Header, ReportID, Modifiers, Reserved, Key1, Key2, Key3, Key4, Key5, Key6]
-        //             let press_report = [
-        //                 0xA1, // HID Data | Input Report
-        //                 0x01, // Report ID (对应 XML 里的键盘)
-        //                 0x00, // Modifiers (Shift, Ctrl 等)
-        //                 0x00, // Reserved
-        //                 0x04, // Key1: 'A' 的 Usage ID
-        //                 0x00, 0x00, 0x00, 0x00, 0x00,
-        //             ];
-        //             sock.write_all(&press_report).await?;
-        //             sock.flush().await?;
+                // 按下 'A' 键
+                let press_report = InputReport::Keyboard {
+                    modifiers: 0x00,
+                    keys: vec![keycodes::KEY_A],
+                };
+                kbd.send_report(press_report).await?;
 
-        //             // 必须停顿一下，iPad 才能识别到按下动作
-        //             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // 停顿一下
+                tokio::time::sleep(Duration::from_millis(50)).await;
 
-        //             // --- 2. 发送松开按键 (全0) ---
-        //             let release_report =
-        //                 [0xA1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        //             sock.write_all(&release_report).await?;
-        //             sock.flush().await?;
+                // 松开所有按键
+                let release_report = InputReport::Keyboard {
+                    modifiers: 0x00,
+                    keys: vec![],
+                };
+                kbd.send_report(release_report).await?;
 
-        //             println!("'A' 键按下并松开完成。");
-        //         }
-        //     } else if i % 10 == 0 {
-        //         println!("等待中... ({}s)", i);
-        //     }
-        // }
+                println!("'A' 键按下并松开完成。");
+                break;
+            } else if i % 10 == 0 {
+                println!("等待中... ({}s)", i);
+            }
+        }
 
         Ok(())
     }
@@ -500,53 +451,67 @@ mod tests {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
         let (keyboard, mouse, session) = build_bluetooth_hid_device().await?;
-        let kbd_arc = Arc::new(keyboard);
-        let kbd_clone = kbd_arc.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) = run_server(&kbd_arc, &session).await {
-                eprintln!("服务器运行出错: {}", e);
-            }
-        });
+        // 使用 Arc 包装
+        let keyboard = Arc::new(Mutex::new(keyboard));
+        let mouse = Arc::new(Mutex::new(mouse));
+        let keyboard_clone = Arc::clone(&keyboard);
+
+        let kbd = keyboard_clone.lock().await;
+        if let Err(e) = run_server(&kbd, &session).await {
+            eprintln!("服务器运行出错: {}", e);
+        }
 
         println!("等待 iPad 连接以开始画图测试...");
 
         for i in 0..600 {
             tokio::time::sleep(Duration::from_secs(1)).await;
 
-            let mut socket_guard = mouse.interrupt_socket.lock().await;
-            if let Some(ref mut sock) = *socket_guard {
-                use tokio::io::AsyncWriteExt;
+            let mut mouse_guard = mouse.lock().await;
+            let is_connected = mouse_guard.interrupt_socket.lock().await.is_some();
+
+            if is_connected {
                 println!("连接成功！准备在屏幕上画一个正方形...");
 
-                // 1. 按下左键 (0x01)
-                let report = [0xA1, 0x02, 0x01, 0, 0];
-                sock.write_all(&report).await?;
+                // 按下左键
+                let press_report = InputReport::Mouse {
+                    buttons: 0x01,
+                    x: 0,
+                    y: 0,
+                    wheel: 0,
+                };
+                mouse_guard.send_report(press_report).await?;
                 tokio::time::sleep(Duration::from_millis(100)).await;
 
                 // 定义位移序列：右、下、左、上
                 let movements = [
-                    (10i8, 0i8), // 右
-                    (0, 10),     // 下
-                    (-10, 0),    // 左
-                    (0, -10),    // 上
+                    (10i16, 0i16), // 右
+                    (0, 10),       // 下
+                    (-10, 0),      // 左
+                    (0, -10),      // 上
                 ];
 
                 for (dx, dy) in movements {
                     for _ in 0..20 {
-                        // 构造报文：[Header, ID, Buttons, X, Y]
-                        let move_report = [0xA1, 0x02, 0x01, dx as u8, dy as u8];
-                        sock.write_all(&move_report).await?;
-                        sock.flush().await?;
-                        // 控制画线速度
+                        let move_report = InputReport::Mouse {
+                            buttons: 0x01, // 保持左键按下
+                            x: dx,
+                            y: dy,
+                            wheel: 0,
+                        };
+                        mouse_guard.send_report(move_report).await?;
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 }
 
-                // 2. 松开左键 (0x00)
-                let release_report = [0xA1, 0x02, 0x00, 0, 0];
-                sock.write_all(&release_report).await?;
-                sock.flush().await?;
+                // 松开左键
+                let release_report = InputReport::Mouse {
+                    buttons: 0x00,
+                    x: 0,
+                    y: 0,
+                    wheel: 0,
+                };
+                mouse_guard.send_report(release_report).await?;
 
                 println!("画图完成！");
                 break;
