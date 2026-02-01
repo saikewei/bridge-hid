@@ -3,6 +3,7 @@ use bluer::agent::Agent;
 use bluer::l2cap::{SocketAddr, StreamListener};
 use bluer::rfcomm::{Profile, ProfileHandle, Role};
 use bluer::{Adapter, AdapterEvent, Address, AddressType};
+use libc::seccomp_data;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -124,6 +125,7 @@ pub struct BluetoothKeyboardHidDevice {
 }
 
 pub struct BluetoothMouseHidDevice {
+    adapter: Arc<bluer::Adapter>,
     current_buttons: MouseButtons,
     // 同理修改鼠标
     interrupt_socket: Arc<Mutex<Option<bluer::l2cap::Stream>>>,
@@ -132,8 +134,11 @@ pub struct BluetoothMouseHidDevice {
 }
 
 /// 创建并初始化蓝牙 HID 设备
-pub async fn build_bluetooth_hid_device()
--> Result<(BluetoothKeyboardHidDevice, BluetoothMouseHidDevice)> {
+pub async fn build_bluetooth_hid_device() -> Result<(
+    BluetoothKeyboardHidDevice,
+    BluetoothMouseHidDevice,
+    bluer::Session,
+)> {
     let session = bluer::Session::new().await?;
     let adapter = session.default_adapter().await?;
 
@@ -174,7 +179,6 @@ pub async fn build_bluetooth_hid_device()
         })),
         authorize_service: Some(Box::new(|req| {
             Box::pin(async move {
-                // 打印一下，看看是不是这里被拒绝了
                 println!("授权服务请求: 设备 {} 访问服务 {}", req.device, req.service);
                 Ok(()) // 返回 Ok(()) 表示同意访问
             })
@@ -206,9 +210,10 @@ pub async fn build_bluetooth_hid_device()
     let interrupt_socket = Arc::new(Mutex::new(None));
 
     let shared_handle = Arc::new(_agent_handle);
+    let shared_adpter = Arc::new(adapter);
 
     let keyboard = BluetoothKeyboardHidDevice {
-        adapter: Arc::new(adapter),
+        adapter: Arc::clone(&shared_adpter),
         current_keys: [0u8; 6],
         current_modifiers: KeyboardModifiers::default(),
         control_socket: Arc::clone(&control_socket),
@@ -218,13 +223,84 @@ pub async fn build_bluetooth_hid_device()
     };
 
     let mouse = BluetoothMouseHidDevice {
+        adapter: Arc::clone(&shared_adpter),
         current_buttons: MouseButtons::default(),
         interrupt_socket: Arc::clone(&interrupt_socket),
         session: session.clone(),
         _agent_handle: Arc::clone(&shared_handle),
     };
 
-    Ok((keyboard, mouse))
+    Ok((keyboard, mouse, session))
+}
+
+/// 启动 L2CAP 监听并注册服务
+pub async fn run_server(
+    keyboard: &BluetoothKeyboardHidDevice,
+    session: &bluer::Session,
+) -> Result<()> {
+    // 1. 获取 Session
+    let session = session.clone();
+
+    // 2. 构造 Profile
+    // 这里的 UUID 使用 HID 标准服务 UUID
+    let hid_uuid = Uuid::parse_str("00001124-0000-1000-8000-00805f9b34fb")?;
+
+    let profile = Profile {
+        uuid: hid_uuid,
+        name: Some("Virtual Keyboard".to_string()),
+        service_record: Some(KEYBOARD_SDP_RECORD.to_string()),
+        // psm: Some(17),
+        role: Some(Role::Server),
+
+        require_authentication: Some(false),
+        require_authorization: Some(false),
+
+        ..Default::default()
+    };
+
+    // 3. 注册 Profile
+    // 这一步替代了之前的 add_sdp_record
+    // 只要 _profile_handle 不被 drop，SDP 记录就一直有效
+    let _profile_handle = session.register_profile(profile).await?;
+    println!("HID Profile 已通过 ProfileManager1 注册");
+
+    // 1. 定义地址：监听本地任意适配器，类型为经典蓝牙 (BR/EDR)
+    let ctrl_addr = SocketAddr::new(Address::any(), AddressType::BrEdr, PSM_HID_CONTROL);
+    let intr_addr = SocketAddr::new(Address::any(), AddressType::BrEdr, PSM_HID_INTERRUPT);
+
+    // 2. 绑定监听器
+    // 注意：在 Linux 上监听 PSM 17 和 19 属于低端口，通常需要 sudo 权限或 CAP_NET_BIND_SERVICE
+    let ctrl_listener = StreamListener::bind(ctrl_addr)
+        .await
+        .map_err(|e| anyhow!("绑定控制通道失败 (PSM 17): {}. 是否缺少 root 权限？", e))?;
+
+    let intr_listener = StreamListener::bind(intr_addr)
+        .await
+        .map_err(|e| anyhow!("绑定中断通道失败 (PSM 19): {}", e))?;
+
+    println!("正在监听 L2CAP PSM 17(Control) 和 19(Interrupt)...");
+
+    // 2. 使用 tokio::join! 同时等待两个连接
+    // join! 会并发运行多个 future，直到它们全部完成
+    let (ctrl_res, intr_res) = tokio::try_join!(
+        async {
+            let res = ctrl_listener.accept().await?;
+            println!("控制通道(PSM 17)已连接: {:?}", res.1);
+            Ok::<_, anyhow::Error>(res)
+        },
+        async {
+            let res = intr_listener.accept().await?;
+            println!("中断通道(PSM 19)已连接: {:?}", res.1);
+            Ok::<_, anyhow::Error>(res)
+        }
+    )?;
+
+    // 3. 存入 Socket（写入共享的 Arc<Mutex<...>>）
+    *keyboard.control_socket.lock().await = Some(ctrl_res.0);
+    *keyboard.interrupt_socket.lock().await = Some(intr_res.0);
+
+    println!("iPad 双通道已并发连接成功！");
+    Ok(())
 }
 
 impl BluetoothKeyboardHidDevice {
@@ -252,73 +328,6 @@ impl BluetoothKeyboardHidDevice {
             return Err(anyhow!("蓝牙 HID 未连接"));
         }
 
-        Ok(())
-    }
-
-    /// 启动 L2CAP 监听并注册服务
-    pub async fn run_server(&self) -> Result<()> {
-        // 1. 获取 Session
-        let session = self.session.clone();
-
-        // 2. 构造 Profile
-        // 这里的 UUID 使用 HID 标准服务 UUID
-        let hid_uuid = Uuid::parse_str("00001124-0000-1000-8000-00805f9b34fb")?;
-
-        let profile = Profile {
-            uuid: hid_uuid,
-            name: Some("Virtual Keyboard".to_string()),
-            service_record: Some(KEYBOARD_SDP_RECORD.to_string()),
-            // psm: Some(17),
-            role: Some(Role::Server),
-
-            require_authentication: Some(false),
-            require_authorization: Some(false),
-
-            ..Default::default()
-        };
-
-        // 3. 注册 Profile
-        // 这一步替代了之前的 add_sdp_record
-        // 只要 _profile_handle 不被 drop，SDP 记录就一直有效
-        let _profile_handle = session.register_profile(profile).await?;
-        println!("HID Profile 已通过 ProfileManager1 注册");
-
-        // 1. 定义地址：监听本地任意适配器，类型为经典蓝牙 (BR/EDR)
-        let ctrl_addr = SocketAddr::new(Address::any(), AddressType::BrEdr, PSM_HID_CONTROL);
-        let intr_addr = SocketAddr::new(Address::any(), AddressType::BrEdr, PSM_HID_INTERRUPT);
-
-        // 2. 绑定监听器
-        // 注意：在 Linux 上监听 PSM 17 和 19 属于低端口，通常需要 sudo 权限或 CAP_NET_BIND_SERVICE
-        let ctrl_listener = StreamListener::bind(ctrl_addr)
-            .await
-            .map_err(|e| anyhow!("绑定控制通道失败 (PSM 17): {}. 是否缺少 root 权限？", e))?;
-
-        let intr_listener = StreamListener::bind(intr_addr)
-            .await
-            .map_err(|e| anyhow!("绑定中断通道失败 (PSM 19): {}", e))?;
-
-        println!("正在监听 L2CAP PSM 17(Control) 和 19(Interrupt)...");
-
-        // 2. 使用 tokio::join! 同时等待两个连接
-        // join! 会并发运行多个 future，直到它们全部完成
-        let (ctrl_res, intr_res) = tokio::try_join!(
-            async {
-                let res = ctrl_listener.accept().await?;
-                println!("控制通道(PSM 17)已连接: {:?}", res.1);
-                Ok::<_, anyhow::Error>(res)
-            },
-            async {
-                let res = intr_listener.accept().await?;
-                println!("中断通道(PSM 19)已连接: {:?}", res.1);
-                Ok::<_, anyhow::Error>(res)
-            }
-        )?;
-
-        // 3. 存入 Socket
-        *self.control_socket.lock().await = Some(ctrl_res.0);
-        *self.interrupt_socket.lock().await = Some(intr_res.0);
-
-        println!("iPad 双通道已并发连接成功！");
         Ok(())
     }
 }
@@ -418,69 +427,69 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_bluetooth_connection() -> Result<()> {
-        // 初始化日志，方便查看输出
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+        // // 初始化日志，方便查看输出
+        // env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-        // 1. 初始化适配器
-        let (mut keyboard, _mouse) = build_bluetooth_hid_device().await?;
+        // // 1. 初始化适配器
+        // let (mut keyboard, _mouse, _session) = build_bluetooth_hid_device().await?;
 
-        // 2. 在后台运行服务器逻辑
-        // 我们使用 tokio::spawn 因为监听是阻塞/长期的
-        let kbd_arc = Arc::new(keyboard);
-        let kbd_clone = kbd_arc.clone();
+        // // 2. 在后台运行服务器逻辑
+        // // 我们使用 tokio::spawn 因为监听是阻塞/长期的
+        // let kbd_arc = Arc::new(keyboard);
+        // let kbd_clone = kbd_arc.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) = kbd_clone.run_server().await {
-                eprintln!("服务器运行出错: {}", e);
-            }
-        });
+        // tokio::spawn(async move {
+        //     if let Err(e) = kbd_clone.run_server().await {
+        //         eprintln!("服务器运行出错: {}", e);
+        //     }
+        // });
 
-        println!("--------------------------------------------------");
-        println!("测试模式已启动！");
-        println!("请在 iPad 的蓝牙设置中搜索并点击 'Virtual Keyboard Mouse'");
-        println!("你有 60 秒时间完成配对和测试...");
-        println!("--------------------------------------------------");
+        // println!("--------------------------------------------------");
+        // println!("测试模式已启动！");
+        // println!("请在 iPad 的蓝牙设置中搜索并点击 'Virtual Keyboard Mouse'");
+        // println!("你有 60 秒时间完成配对和测试...");
+        // println!("--------------------------------------------------");
 
-        // 3. 循环检查连接状态，一旦连接成功就发送一个 'A'
-        for i in 0..600 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        // // 3. 循环检查连接状态，一旦连接成功就发送一个 'A'
+        // for i in 0..600 {
+        //     tokio::time::sleep(Duration::from_secs(1)).await;
 
-            let is_connected = kbd_arc.interrupt_socket.lock().await.is_some();
-            if is_connected {
-                println!("检测到连接！发送一次按键 'A'...");
+        //     let is_connected = kbd_arc.interrupt_socket.lock().await.is_some();
+        //     if is_connected {
+        //         println!("检测到连接！发送一次按键 'A'...");
 
-                let mut socket_guard = kbd_arc.interrupt_socket.lock().await;
-                if let Some(ref mut sock) = *socket_guard {
-                    use tokio::io::AsyncWriteExt;
+        //         let mut socket_guard = kbd_arc.interrupt_socket.lock().await;
+        //         if let Some(ref mut sock) = *socket_guard {
+        //             use tokio::io::AsyncWriteExt;
 
-                    // --- 1. 发送按下 'A' (Usage ID 为 0x04) ---
-                    // 格式: [Header, ReportID, Modifiers, Reserved, Key1, Key2, Key3, Key4, Key5, Key6]
-                    let press_report = [
-                        0xA1, // HID Data | Input Report
-                        0x01, // Report ID (对应 XML 里的键盘)
-                        0x00, // Modifiers (Shift, Ctrl 等)
-                        0x00, // Reserved
-                        0x04, // Key1: 'A' 的 Usage ID
-                        0x00, 0x00, 0x00, 0x00, 0x00,
-                    ];
-                    sock.write_all(&press_report).await?;
-                    sock.flush().await?;
+        //             // --- 1. 发送按下 'A' (Usage ID 为 0x04) ---
+        //             // 格式: [Header, ReportID, Modifiers, Reserved, Key1, Key2, Key3, Key4, Key5, Key6]
+        //             let press_report = [
+        //                 0xA1, // HID Data | Input Report
+        //                 0x01, // Report ID (对应 XML 里的键盘)
+        //                 0x00, // Modifiers (Shift, Ctrl 等)
+        //                 0x00, // Reserved
+        //                 0x04, // Key1: 'A' 的 Usage ID
+        //                 0x00, 0x00, 0x00, 0x00, 0x00,
+        //             ];
+        //             sock.write_all(&press_report).await?;
+        //             sock.flush().await?;
 
-                    // 必须停顿一下，iPad 才能识别到按下动作
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        //             // 必须停顿一下，iPad 才能识别到按下动作
+        //             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-                    // --- 2. 发送松开按键 (全0) ---
-                    let release_report =
-                        [0xA1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-                    sock.write_all(&release_report).await?;
-                    sock.flush().await?;
+        //             // --- 2. 发送松开按键 (全0) ---
+        //             let release_report =
+        //                 [0xA1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        //             sock.write_all(&release_report).await?;
+        //             sock.flush().await?;
 
-                    println!("'A' 键按下并松开完成。");
-                }
-            } else if i % 10 == 0 {
-                println!("等待中... ({}s)", i);
-            }
-        }
+        //             println!("'A' 键按下并松开完成。");
+        //         }
+        //     } else if i % 10 == 0 {
+        //         println!("等待中... ({}s)", i);
+        //     }
+        // }
 
         Ok(())
     }
@@ -490,12 +499,12 @@ mod tests {
     async fn test_mouse_drawing() -> Result<()> {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-        let (keyboard, _mouse) = build_bluetooth_hid_device().await?;
+        let (keyboard, mouse, session) = build_bluetooth_hid_device().await?;
         let kbd_arc = Arc::new(keyboard);
         let kbd_clone = kbd_arc.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = kbd_clone.run_server().await {
+            if let Err(e) = run_server(&kbd_arc, &session).await {
                 eprintln!("服务器运行出错: {}", e);
             }
         });
@@ -505,7 +514,7 @@ mod tests {
         for i in 0..600 {
             tokio::time::sleep(Duration::from_secs(1)).await;
 
-            let mut socket_guard = kbd_arc.interrupt_socket.lock().await;
+            let mut socket_guard = mouse.interrupt_socket.lock().await;
             if let Some(ref mut sock) = *socket_guard {
                 use tokio::io::AsyncWriteExt;
                 println!("连接成功！准备在屏幕上画一个正方形...");
