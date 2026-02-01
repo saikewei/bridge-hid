@@ -88,37 +88,45 @@ struct MouseState {
     dirty: bool,
 }
 
-pub struct InputManager {
-    event_rx: mpsc::UnboundedReceiver<InputReport>,
+pub struct LedHandle {
     keyboard_controls: Arc<Mutex<Vec<mpsc::UnboundedSender<LedState>>>>,
     current_led_state: Arc<Mutex<LedState>>,
 }
 
+impl LedHandle {
+    pub fn new() -> Self {
+        Self {
+            keyboard_controls: Arc::new(Mutex::new(Vec::new())),
+            current_led_state: Arc::new(Mutex::new(LedState::default())),
+        }
+    }
+
+    pub async fn set_leds(&self, ctrl: &LedState) {
+        let mut controls = self.keyboard_controls.lock().unwrap();
+        self.current_led_state.lock().unwrap().clone_from(&ctrl);
+        // 发送指令并移除已失效的设备连接
+        controls.retain(|tx| tx.send(ctrl.clone()).is_ok());
+    }
+}
+
+pub struct InputManager {
+    event_rx: mpsc::UnboundedReceiver<InputReport>,
+    pub led_handle: Option<LedHandle>,
+}
+
 impl InputManager {
-    pub fn new(init_led_state: Option<LedState>) -> Self {
+    pub fn new() -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-        // 1. 初始化空的控制器列表
-        let keyboard_controls: Arc<Mutex<Vec<mpsc::UnboundedSender<LedState>>>> =
-            Arc::new(Mutex::new(Vec::new()));
-
-        // 2. 克隆 Arc 传递给后台监听任务
-        let keyboard_controls_clone = Arc::clone(&keyboard_controls);
-        let current_led_state = Arc::new(Mutex::new(init_led_state.unwrap_or(LedState {
-            num_lock: false,
-            caps_lock: false,
-            scroll_lock: false,
-            compose: false,
-            kana: false,
-        })));
-        let current_led_state_clone = Arc::clone(&current_led_state);
+        let led_handle = LedHandle::new();
+        let keyboard_controls = Arc::clone(&led_handle.keyboard_controls);
+        let current_led_state = Arc::clone(&led_handle.current_led_state);
 
         // 启动设备扫描和监控
         tokio::spawn(async move {
             // --- 修改点：传入 keyboard_controls_clone ---
             if let Err(e) =
-                Self::monitor_devices(event_tx, keyboard_controls_clone, current_led_state_clone)
-                    .await
+                Self::monitor_devices(event_tx, keyboard_controls, current_led_state).await
             {
                 eprintln!("Monitor Devices task failed: {:?}", e);
             }
@@ -126,23 +134,8 @@ impl InputManager {
 
         Self {
             event_rx: event_rx,
-            keyboard_controls: keyboard_controls, // 这里的 Arc 之后用于 set_all_leds
-            current_led_state: Arc::new(Mutex::new(init_led_state.unwrap_or(LedState {
-                num_lock: false,
-                caps_lock: false,
-                scroll_lock: false,
-                compose: false,
-                kana: false,
-            }))),
+            led_handle: Some(led_handle),
         }
-    }
-
-    /// 统一控制入口：更改所有键盘的灯光
-    pub async fn set_all_leds(&self, ctrl: LedState) {
-        let mut controls = self.keyboard_controls.lock().unwrap();
-        self.current_led_state.lock().unwrap().clone_from(&ctrl);
-        // 发送指令并移除已失效的设备连接
-        controls.retain(|tx| tx.send(ctrl.clone()).is_ok());
     }
 
     async fn monitor_devices(
@@ -165,21 +158,34 @@ impl InputManager {
 
                         if !already_monitored {
                             // 尝试打开设备
-                            if let Ok(device) = Device::open(&path_buf) {
+                            if let Ok(mut device) = Device::open(&path_buf) {
                                 if let Some(device_type) = Self::detect_device_type(&device) {
                                     active_monitors.lock().unwrap().insert(path_str.clone());
 
                                     let tx_clone = tx.clone();
                                     let mut led_rx_to_pass = None;
+                                    let mut current_led_state_clone = None;
 
                                     // 如果是键盘，创建 LED 控制通道
                                     if device_type == DeviceType::Keyboard {
+                                        device.grab().expect("独占失败！");
                                         let (led_tx, led_rx) =
                                             mpsc::unbounded_channel::<LedState>();
                                         // 将 tx 存入全局列表，以便 InputManager::set_all_leds 广播
                                         keyboard_controls.lock().unwrap().push(led_tx);
                                         // 将 rx 准备好传给 monitor.run
                                         led_rx_to_pass = Some(led_rx);
+                                        current_led_state_clone = Some(
+                                            current_led_state
+                                                .lock()
+                                                .map(|guard| guard.clone())
+                                                .unwrap_or_default(),
+                                        );
+
+                                        println!(
+                                            "current_led_state_clone: {:?}",
+                                            current_led_state_clone
+                                        );
                                     }
                                     let path_id = path_str.clone();
                                     let active_monitors_clone = Arc::clone(&active_monitors);
@@ -198,6 +204,15 @@ impl InputManager {
                                         active_monitors_clone.lock().unwrap().remove(&path_id);
                                         println!("Stopped monitoring: {}", path_id);
                                     });
+
+                                    // 发送当前 LED 状态以同步新连接的键盘
+                                    if let Some(ctrl) = current_led_state_clone {
+                                        if let Some(last_tx) =
+                                            keyboard_controls.lock().unwrap().last()
+                                        {
+                                            let _ = last_tx.send(ctrl);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -662,7 +677,7 @@ mod tests {
     #[ignore]
     async fn test_input_manager() {
         println!("Starting InputManager test. Please provide keyboard/mouse input...");
-        let mut manager = InputManager::new(None);
+        let mut manager = InputManager::new();
 
         while let Some(report) = manager.next_event().await {
             println!("Input report: {:?}", report);
@@ -673,7 +688,7 @@ mod tests {
     #[ignore]
     async fn test_set_all_leds() {
         println!("Starting LED control test. Please observe keyboard LEDs...");
-        let manager = InputManager::new(None);
+        let mut manager = InputManager::new();
         let led_state_1 = LedState {
             num_lock: true,
             caps_lock: false,
@@ -689,10 +704,12 @@ mod tests {
             compose: false,
             kana: false,
         };
+
+        let led_handle = manager.led_handle.take().unwrap();
         for _ in 0..100 {
-            manager.set_all_leds(led_state_1.clone()).await;
+            led_handle.set_leds(&led_state_1).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            manager.set_all_leds(led_state_2.clone()).await;
+            led_handle.set_leds(&led_state_2).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
         println!("Sent LED state to all keyboards.");
