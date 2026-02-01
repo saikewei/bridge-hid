@@ -7,7 +7,9 @@ use bluer::{Adapter, AdapterEvent, Address, AddressType};
 use libc::seccomp_data;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use usb_gadget::function::hid::Hid;
 use uuid::Uuid;
 
 use super::{
@@ -85,14 +87,14 @@ const KEYBOARD_SDP_RECORD: &str = r#"
   <attribute id="0x0201">
     <uint16 value="0x0111" />
   </attribute>
-  <attribute id="0x0202">
-    <uint8 value="0x40" />
-  </attribute>
+    <attribute id="0x0202">
+    <uint8 value="0xC0" />
+    </attribute>
   <attribute id="0x0203">
     <uint8 value="0x21" />
   </attribute>
   <attribute id="0x0204">
-    <boolean value="true" />
+    <boolean value="true" />  <!-- NormallyConnectable = false 表示需要保持连接 -->
   </attribute>
   <attribute id="0x0205">
     <boolean value="true" />
@@ -113,6 +115,12 @@ const KEYBOARD_SDP_RECORD: &str = r#"
       </sequence>
     </sequence>
   </attribute>
+  <attribute id="0x0209">
+  <uint16 value="0x0012" />
+</attribute>
+<attribute id="0x020A">
+  <uint16 value="0x0640" />
+</attribute>
 </record>
 "#;
 
@@ -202,10 +210,6 @@ pub async fn build_bluetooth_hid_device() -> Result<(
     // 注册 Agent
     let _agent_handle = session.register_agent(agent).await?;
     println!("Bluetooth Agent 已注册并设置为默认");
-
-    // 设置设备类别为键盘
-    // Class: 0x002540 (Keyboard, Pointing device)
-    // adapter.set_class(0x002540).await?;
 
     log::info!("蓝牙适配器已配置: {}", adapter.name());
     log::info!("适配器地址: {}", adapter.address().await?);
@@ -303,6 +307,9 @@ pub async fn run_server(
     *keyboard.control_socket.lock().await = Some(ctrl_res.0);
     *keyboard.interrupt_socket.lock().await = Some(intr_res.0);
 
+    keyboard.adapter.set_discoverable(false).await?;
+    keyboard.adapter.set_pairable(false).await?;
+
     println!("iPad 双通道已并发连接成功！");
     Ok(())
 }
@@ -353,27 +360,25 @@ impl HidReportSender for BluetoothMouseHidDevice {
         {
             let mut socket_guard = self.interrupt_socket.lock().await;
             if let Some(ref mut sock) = *socket_guard {
-                // HID鼠标报告格式: [Header, ReportID, Buttons, X_low, X_high, Y_low, Y_high, Wheel]
-                // 匹配 HID 描述符: 按钮(3bit) + X(12bit) + Y(12bit) + Wheel(8bit)
-                let hid_report = [
-                    0xA1,                    // HID Data | Input Report
-                    0x02,                    // Report ID (鼠标)
-                    buttons,                 // 按钮状态 (Bit 0-2: 左中右, Bit 3-7: 其他)
-                    (x & 0xFF) as u8,        // X低字节
-                    ((x >> 8) & 0x0F) as u8, // X高4位
-                    (y & 0xFF) as u8,        // Y低字节
-                    ((y >> 8) & 0x0F) as u8, // Y高4位
-                    wheel as u8,             // 滚轮 (有符号8位)
-                ];
+                let x8 = x.clamp(-127, 127) as i8;
+                let y8 = y.clamp(-127, 127) as i8;
+
+                let hid_report = [0xA1, 0x02, buttons, x8 as u8, y8 as u8];
 
                 sock.write_all(&hid_report).await?;
-                sock.flush().await?;
-
-                self.current_buttons = MouseButtons::from_bits_truncate(buttons);
             }
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl HidLedReader for BluetoothKeyboardHidDevice {
+    /// 读取 LED 状态（如大写锁定等）
+    async fn get_led_state(&mut self) -> Result<Option<LedState>> {
+        // 返回默认状态
+        Ok(None)
     }
 }
 
