@@ -1,5 +1,6 @@
 use anyhow::{Ok, Result, anyhow};
 use async_trait::async_trait;
+use glob;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -7,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::File as TokioFile;
 use tokio::io::AsyncWriteExt;
+use tokio::time::{Duration, sleep, timeout};
 use usb_gadget::{Class, Config, Gadget, Id, Strings, default_udc, function::hid::Hid};
 
 use crate::output::InputReport;
@@ -102,7 +104,18 @@ pub async fn build_usb_hid_device() -> Result<(
     UsbKeyboardHidDevice,
     UsbMouseHidDevice,
 )> {
-    usb_gadget::remove_all().map_err(|e| anyhow!("无法移除现有 gadgets: {}", e))?;
+    match usb_gadget::remove_all() {
+        std::result::Result::Ok(_) => {}
+        Err(e) => {
+            // 只有当错误不是"文件不存在"时才报错
+            let err_str = e.to_string();
+            if !err_str.contains("No such file or directory") && !err_str.contains("os error 2") {
+                return Err(anyhow!("无法移除现有 gadgets: {}", e));
+            }
+            // 否则静默忽略，继续执行
+            println!("注意: 没有现有 gadgets 需要移除");
+        }
+    }
 
     // 创建键盘 HID 功能
     let mut keyboard_builder = Hid::builder();
@@ -180,6 +193,8 @@ pub async fn build_usb_hid_device() -> Result<(
 
     let mouse_file_tokio = TokioFile::from_std(mouse_file);
 
+    let _ = wait_for_enumeration(10).await?;
+
     Ok((
         UsbKeyboardHidDevice {
             keyboard_file: Some(keyboard_file_tokio),
@@ -194,6 +209,32 @@ pub async fn build_usb_hid_device() -> Result<(
             _registration: Arc::clone(&shared_reg),
         },
     ))
+}
+
+/// 等待 USB HID 设备被主机枚举
+pub async fn wait_for_enumeration(timeout_secs: u64) -> anyhow::Result<()> {
+    let udc_state_path = "/sys/class/udc/*/state";
+
+    timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            // 查找 UDC 状态文件
+            if let std::result::Result::Ok(entries) = glob::glob("/sys/class/udc/*/state") {
+                for entry in entries.flatten() {
+                    if let std::result::Result::Ok(state) = tokio::fs::read_to_string(&entry).await
+                    {
+                        let state = state.trim();
+                        // "configured" 表示设备已被主机成功枚举
+                        if state == "configured" {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("等待 USB 枚举超时"))?
 }
 
 #[async_trait]
