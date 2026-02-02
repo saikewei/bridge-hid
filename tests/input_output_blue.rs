@@ -1,5 +1,7 @@
 use bridge_hid::input::{self, InputManager};
-use bridge_hid::output::bluetooth::{build_bluetooth_hid_device, run_server};
+use bridge_hid::output::bluetooth_ble::{
+    BluetoothBleKeyboardHidDevice, BluetoothBleMouseHidDevice, build_ble_hid_device, run_ble_server,
+};
 use bridge_hid::output::{self, HidLedReader, HidReportSender};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -11,10 +13,10 @@ async fn test_blue_input_output() {
     println!("Starting blue input/output test...");
     let mut manager = InputManager::new();
 
-    let (mut keyboard, mut mouse, session) = build_bluetooth_hid_device().await.unwrap();
-    if let Err(e) = run_server(&keyboard, &session).await {
-        eprintln!("服务器运行出错: {}", e);
-    }
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let (mut keyboard, mut mouse, _session) = build_ble_hid_device().await.unwrap();
+    let (_app_handle, _adv_handle) = run_ble_server(&keyboard, &mouse).await.unwrap();
 
     tokio::spawn(async move {
         loop {
@@ -30,5 +32,6 @@ async fn test_blue_input_output() {
             }
         }
     })
-    .await;
+    .await
+    .unwrap();
 }

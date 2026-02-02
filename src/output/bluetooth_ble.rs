@@ -246,6 +246,10 @@ pub async fn run_ble_server(
     let adv_handle = adapter.advertise(adv).await?;
     log::info!("BLE 广播已启动");
 
+    if mouse.mouse_notifier.lock().await.is_some() {
+        log::info!("连接成功！");
+    }
+
     Ok((app_handle, adv_handle))
 }
 
@@ -557,7 +561,7 @@ impl HidReportSender for BluetoothBleKeyboardHidDevice {
                     hid_report.push(*keys.get(i).unwrap_or(&0x00));
                 }
 
-                log::info!("发送键盘报告: {:02X?}", hid_report);
+                // log::info!("发送键盘报告: {:02X?}", hid_report);
                 tx.send(hid_report)
                     .await
                     .map_err(|e| anyhow!("发送键盘报告失败: {}", e))?;
@@ -597,7 +601,7 @@ impl HidReportSender for BluetoothBleMouseHidDevice {
                 // BLE HID 通知时不包含 Report ID！
                 // 只发送: [buttons, x, y, wheel] = 4 字节
                 let hid_report = vec![buttons, x, y, wheel];
-                log::info!("发送鼠标报告: {:02X?}", hid_report);
+                // log::info!("发送鼠标报告: {:02X?}", hid_report);
                 tx.send(hid_report)
                     .await
                     .map_err(|e| anyhow!("发送鼠标报告失败: {}", e))?;
