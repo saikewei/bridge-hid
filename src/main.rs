@@ -1,4 +1,5 @@
 use bridge_hid::input;
+use bridge_hid::logging;
 use bridge_hid::output;
 
 fn main() {
