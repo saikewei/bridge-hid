@@ -1,6 +1,7 @@
-use anyhow::{Ok, Result, anyhow};
+use anyhow::{Context, Ok, Result, anyhow};
 use async_trait::async_trait;
 use glob;
+use log::{debug, error, info, warn};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -104,17 +105,12 @@ pub async fn build_usb_hid_device() -> Result<(
     UsbKeyboardHidDevice,
     UsbMouseHidDevice,
 )> {
-    match usb_gadget::remove_all() {
-        std::result::Result::Ok(_) => {}
-        Err(e) => {
-            // 只有当错误不是"文件不存在"时才报错
-            let err_str = e.to_string();
-            if !err_str.contains("No such file or directory") && !err_str.contains("os error 2") {
-                return Err(anyhow!("无法移除现有 gadgets: {}", e));
-            }
-            // 否则静默忽略，继续执行
-            println!("注意: 没有现有 gadgets 需要移除");
+    if let Err(e) = usb_gadget::remove_all() {
+        let err_str = e.to_string();
+        if !err_str.contains("No such file or directory") && !err_str.contains("os error 2") {
+            return Err(e).context("无法移除现有 gadgets");
         }
+        warn!("没有现有 gadgets 需要移除");
     }
 
     // 创建键盘 HID 功能
@@ -134,7 +130,7 @@ pub async fn build_usb_hid_device() -> Result<(
     let (mouse_hid, mouse_handle) = mouse_builder.build();
 
     // 获取 UDC
-    let udc = default_udc().map_err(|e| anyhow!("获取 UDC 失败: {}", e))?;
+    let udc = default_udc().context("获取 UDC 失败")?;
 
     // 创建 USB Gadget
     let mut gadget = Gadget::new(
@@ -149,9 +145,7 @@ pub async fn build_usb_hid_device() -> Result<(
     gadget.add_config(config);
 
     // 注册并绑定
-    let reg = gadget
-        .bind(&udc)
-        .map_err(|e| anyhow!("注册并绑定 Gadget 失败: {}", e))?;
+    let reg = gadget.bind(&udc).context("注册并绑定 Gadget 失败")?;
 
     let shared_reg = Arc::new(reg);
 
@@ -159,37 +153,31 @@ pub async fn build_usb_hid_device() -> Result<(
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     // 获取设备文件路径
-    let keyboard_dev = keyboard_hid
-        .device()
-        .map_err(|e| anyhow!("获取键盘设备号失败: {}", e))?;
-    let mouse_dev = mouse_hid
-        .device()
-        .map_err(|e| anyhow!("获取鼠标设备号失败: {}", e))?;
+    let keyboard_dev = keyboard_hid.device().context("获取键盘设备号失败")?;
+    let mouse_dev = mouse_hid.device().context("获取鼠标设备号失败")?;
 
     let keyboard_path = find_hidg_device(keyboard_dev.0, keyboard_dev.1)?;
     let mouse_path = find_hidg_device(mouse_dev.0, mouse_dev.1)?;
 
-    // 1. 打开标准库文件句柄
     let keyboard_file = OpenOptions::new()
         .write(true)
         .read(true)
         // .custom_flags(libc::O_NONBLOCK)
         .open(&keyboard_path)
-        .map_err(|e| anyhow!("打开键盘设备 {} 失败: {}", keyboard_path.display(), e))?;
+        .with_context(|| format!("打开键盘设备 {} 失败", keyboard_path.display()))?;
 
     let keyboard_file_tokio = TokioFile::from_std(keyboard_file);
     let keyboard_file_tokio_clone = keyboard_file_tokio
         .try_clone()
         .await
-        .map_err(|e| anyhow!("克隆键盘文件句柄失败: {}", e))?;
+        .context("克隆键盘文件句柄失败")?;
 
-    // 1. 打开标准库文件句柄
     let mouse_file = OpenOptions::new()
         .write(true)
         .read(true)
         // .custom_flags(libc::O_NONBLOCK)
         .open(&mouse_path)
-        .map_err(|e| anyhow!("打开鼠标设备 {} 失败: {}", mouse_path.display(), e))?;
+        .with_context(|| format!("打开鼠标设备 {} 失败", mouse_path.display()))?;
 
     let mouse_file_tokio = TokioFile::from_std(mouse_file);
 
@@ -234,7 +222,9 @@ pub async fn wait_for_enumeration(timeout_secs: u64) -> anyhow::Result<()> {
         }
     })
     .await
-    .map_err(|_| anyhow::anyhow!("等待 USB 枚举超时"))?
+    .context("等待 USB 枚举超时")??;
+
+    Ok(())
 }
 
 #[async_trait]
@@ -256,7 +246,7 @@ impl HidReportSender for UsbKeyboardHidDevice {
                 if let Some(ref mut file) = self.keyboard_file {
                     file.write_all(&data)
                         .await
-                        .map_err(|e| anyhow!("异步发送键盘报告失败: {}", e))?;
+                        .context("异步发送键盘报告失败")?;
                     // file.flush().await?;
                 }
             }
@@ -314,7 +304,7 @@ impl HidReportSender for UsbMouseHidDevice {
                 if let Some(ref mut file) = self.mouse_file {
                     file.write_all(&data)
                         .await
-                        .map_err(|e| anyhow!("异步发送鼠标报告失败: {}", e))?;
+                        .context("异步发送鼠标报告失败")?;
 
                     // file.flush().await?;
                 }
@@ -357,7 +347,7 @@ mod tests {
         let (mut kb_hid_device, _, mut mouse_hid_device) =
             build_usb_hid_device().await.expect("创建 USB HID 设备失败");
 
-        println!("等待 USB 设备枚举...");
+        info!("等待 USB 设备枚举...");
         std::thread::sleep(std::time::Duration::from_secs(2));
 
         let keys = [
@@ -369,7 +359,7 @@ mod tests {
         ];
 
         for (i, key) in keys.iter().enumerate() {
-            println!("发送按键 {}/{}...", i + 1, keys.len());
+            debug!("发送按键 {}/{}...", i + 1, keys.len());
             if let Err(e) = kb_hid_device
                 .send_report(InputReport::Keyboard {
                     modifiers: 0,
@@ -377,7 +367,7 @@ mod tests {
                 })
                 .await
             {
-                eprintln!("释放按键失败: {:?}", e);
+                error!("释放按键失败: {:?}", e);
             }
             if let Err(e) = kb_hid_device
                 .send_report(InputReport::Keyboard {
@@ -386,13 +376,13 @@ mod tests {
                 })
                 .await
             {
-                eprintln!("释放按键失败: {:?}", e);
+                error!("释放按键失败: {:?}", e);
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
         std::thread::sleep(std::time::Duration::from_secs(1));
-        println!("移动鼠标...");
+        info!("移动鼠标...");
         for _ in 0..50 {
             mouse_hid_device
                 .send_report(InputReport::Mouse {
@@ -434,19 +424,19 @@ mod tests {
         let (mut kb_hid_device, _, _) =
             build_usb_hid_device().await.expect("创建 USB HID 设备失败");
 
-        println!("等待 USB 设备枚举...");
+        info!("等待 USB 设备枚举...");
         std::thread::sleep(std::time::Duration::from_secs(2));
 
         // 1. 初始化一个“上一次状态”的缓存
         let mut last_led_state: Option<LedState> = None;
 
-        println!("等待 LED 状态变化...");
+        info!("等待 LED 状态变化...");
         loop {
             match kb_hid_device.get_led_state().await {
                 std::result::Result::Ok(Some(new_state)) => {
                     // 2. 只有新旧状态不同，才打印并执行逻辑
                     if Some(new_state) != last_led_state {
-                        println!("LED 状态发生变更: {:?}", new_state);
+                        info!("LED 状态发生变更: {:?}", new_state);
 
                         // 3. 更新缓存
                         last_led_state = Some(new_state);
@@ -457,7 +447,7 @@ mod tests {
                 }
                 std::result::Result::Ok(None) => {}
                 Err(e) => {
-                    eprintln!("读取失败: {}", e);
+                    error!("读取失败: {}", e);
                     break;
                 }
             }

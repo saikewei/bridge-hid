@@ -1,4 +1,5 @@
 use bridge_hid::input::{self, InputManager};
+use bridge_hid::logging::init;
 use bridge_hid::output::bluetooth_ble::{
     BluetoothBleKeyboardHidDevice, BluetoothBleMouseHidDevice, build_ble_hid_device, run_ble_server,
 };
@@ -10,10 +11,9 @@ use tokio::sync::Mutex;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn test_blue_input_output() {
+    init();
     println!("Starting blue input/output test...");
     let mut manager = InputManager::new();
-
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let (mut keyboard, mut mouse, _session) = build_ble_hid_device().await.unwrap();
     let (_app_handle, _adv_handle) = run_ble_server(&keyboard, &mouse).await.unwrap();
