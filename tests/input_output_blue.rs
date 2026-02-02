@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 async fn test_blue_input_output() {
     init();
     println!("Starting blue input/output test...");
-    let mut manager = InputManager::new();
+    let mut manager = InputManager::new(125);
 
     let (mut keyboard, mut mouse, _session) = build_ble_hid_device().await.unwrap();
     let (_app_handle, _adv_handle) = run_ble_server(&keyboard, &mouse).await.unwrap();

@@ -432,7 +432,7 @@ async fn build_gatt_application(state: Arc<BleHidState>) -> Result<Application> 
                             log::info!("鼠标 Report 通知已启用");
 
                             while let Some(report) = rx.recv().await {
-                                log::debug!("发送鼠标报告: {:02X?}", report);
+                                log::trace!("发送鼠标报告: {:02X?}", report);
                                 if let Err(e) = notifier.notify(report).await {
                                     log::error!("通知发送失败: {}", e);
                                     break;

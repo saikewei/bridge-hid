@@ -6,10 +6,17 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// 鼠标报告率控制器，可在运行时动态调整
+#[derive(Clone)]
+pub struct MouseRateController {
+    /// 报告间隔（微秒），使用原子类型支持无锁修改
+    interval_micros: Arc<AtomicU32>,
+}
 
 #[derive(Debug, Clone)]
 pub enum InputReport {
@@ -84,15 +91,144 @@ struct KeyboardState {
 #[derive(Default)]
 struct MouseState {
     buttons: u8,
-    x_delta: i16,
-    y_delta: i16,
-    wheel_delta: i8,
+    x_delta: i32,
+    y_delta: i32,
+    wheel_delta: i32,
     dirty: bool,
+    button_changed: bool,
+    last_report_time: Option<Instant>,
+    rate_controller: MouseRateController,
+}
+
+impl MouseState {
+    fn new(rate_controller: MouseRateController) -> Self {
+        Self {
+            buttons: 0,
+            x_delta: 0,
+            y_delta: 0,
+            wheel_delta: 0,
+            dirty: false,
+            button_changed: false,
+            last_report_time: None,
+            rate_controller,
+        }
+    }
+
+    /// 检查是否应该发送报告
+    fn should_send_report(&self) -> bool {
+        // 按钮变化必须立即发送
+        if self.button_changed {
+            return true;
+        }
+
+        // 未启用限流时直接发送
+        if !self.rate_controller.is_enabled() {
+            return true;
+        }
+
+        // 检查时间间隔
+        let interval = self.rate_controller.get_interval();
+        self.last_report_time
+            .map(|t| t.elapsed() >= interval)
+            .unwrap_or(true) // 首次必发
+    }
+
+    /// 累积 X 移动量
+    fn accumulate_x(&mut self, delta: i32) {
+        self.x_delta = self.x_delta.saturating_add(delta);
+        self.dirty = true;
+    }
+
+    /// 累积 Y 移动量
+    fn accumulate_y(&mut self, delta: i32) {
+        self.y_delta = self.y_delta.saturating_add(delta);
+        self.dirty = true;
+    }
+
+    /// 累积滚轮量
+    fn accumulate_wheel(&mut self, delta: i32) {
+        self.wheel_delta = self.wheel_delta.saturating_add(delta);
+        self.dirty = true;
+    }
+
+    /// 构建报告并重置状态
+    fn build_report(&mut self) -> InputReport {
+        let report = InputReport::Mouse {
+            buttons: self.buttons,
+            // 裁剪到 i16 范围
+            x: self.x_delta.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            y: self.y_delta.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            wheel: self.wheel_delta.clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+        };
+
+        // 重置累积值
+        self.x_delta = 0;
+        self.y_delta = 0;
+        self.wheel_delta = 0;
+        self.dirty = false;
+        self.button_changed = false;
+        self.last_report_time = Some(Instant::now());
+
+        report
+    }
 }
 
 pub struct LedHandle {
     keyboard_controls: Arc<Mutex<Vec<mpsc::UnboundedSender<LedState>>>>,
     current_led_state: Arc<Mutex<LedState>>,
+}
+
+impl MouseRateController {
+    /// 创建新的控制器
+    /// - `rate_hz`: 初始报告率（Hz），设为 0 表示不限制
+    pub fn new(rate_hz: u32) -> Self {
+        Self {
+            interval_micros: Arc::new(AtomicU32::new(Self::hz_to_micros(rate_hz))),
+        }
+    }
+
+    /// 设置报告率
+    /// - `rate_hz`: 目标报告率（Hz），设为 0 表示不限制
+    pub fn set_rate(&self, rate_hz: u32) {
+        let micros = Self::hz_to_micros(rate_hz);
+        self.interval_micros.store(micros, Ordering::Relaxed);
+        info!(
+            "Mouse report rate set to {} Hz (interval: {} μs)",
+            if rate_hz == 0 {
+                "unlimited".to_string()
+            } else {
+                rate_hz.to_string()
+            },
+            micros
+        );
+    }
+
+    /// 获取当前报告率（Hz）
+    pub fn get_rate(&self) -> u32 {
+        let micros = self.interval_micros.load(Ordering::Relaxed);
+        if micros == 0 { 0 } else { 1_000_000 / micros }
+    }
+
+    /// 获取当前间隔
+    fn get_interval(&self) -> Duration {
+        let micros = self.interval_micros.load(Ordering::Relaxed);
+        Duration::from_micros(micros as u64)
+    }
+
+    /// 是否启用限流
+    fn is_enabled(&self) -> bool {
+        self.interval_micros.load(Ordering::Relaxed) > 0
+    }
+
+    fn hz_to_micros(rate_hz: u32) -> u32 {
+        if rate_hz == 0 { 0 } else { 1_000_000 / rate_hz }
+    }
+}
+
+impl Default for MouseRateController {
+    fn default() -> Self {
+        Self::new(0) // 默认不限制
+    }
 }
 
 impl LedHandle {
@@ -114,35 +250,55 @@ impl LedHandle {
 pub struct InputManager {
     event_rx: mpsc::UnboundedReceiver<InputReport>,
     pub led_handle: Option<LedHandle>,
+    pub mouse_rate_controller: MouseRateController,
 }
 
 impl InputManager {
-    pub fn new() -> Self {
+    pub fn new(rate_hz: u32) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let led_handle = LedHandle::new();
         let keyboard_controls = Arc::clone(&led_handle.keyboard_controls);
         let current_led_state = Arc::clone(&led_handle.current_led_state);
 
-        // 启动设备扫描和监控
+        let mouse_rate_controller = MouseRateController::new(rate_hz);
+        let rate_controller_clone = mouse_rate_controller.clone();
+
         tokio::spawn(async move {
-            if let Err(e) =
-                Self::monitor_devices(event_tx, keyboard_controls, current_led_state).await
+            if let Err(e) = Self::monitor_devices(
+                event_tx,
+                keyboard_controls,
+                current_led_state,
+                rate_controller_clone, // 传递控制器
+            )
+            .await
             {
                 error!("Monitor Devices task failed: {}", e);
             }
         });
 
         Self {
-            event_rx: event_rx,
+            event_rx,
             led_handle: Some(led_handle),
+            mouse_rate_controller,
         }
+    }
+
+    /// 动态设置鼠标报告率
+    pub fn set_mouse_rate(&self, rate_hz: u32) {
+        self.mouse_rate_controller.set_rate(rate_hz);
+    }
+
+    /// 获取当前鼠标报告率
+    pub fn get_mouse_rate(&self) -> u32 {
+        self.mouse_rate_controller.get_rate()
     }
 
     async fn monitor_devices(
         tx: mpsc::UnboundedSender<InputReport>,
         keyboard_controls: Arc<Mutex<Vec<mpsc::UnboundedSender<LedState>>>>,
         current_led_state: Arc<Mutex<LedState>>,
+        mouse_rate_controller: MouseRateController,
     ) -> anyhow::Result<()> {
         use tokio::time::{Duration, sleep};
         let active_monitors = Arc::new(Mutex::new(HashSet::<String>::new()));
@@ -166,6 +322,13 @@ impl InputManager {
                                     let tx_clone = tx.clone();
                                     let mut led_rx_to_pass = None;
                                     let mut current_led_state_clone = None;
+
+                                    let rate_controller_for_device =
+                                        if device_type == DeviceType::Mouse {
+                                            Some(mouse_rate_controller.clone())
+                                        } else {
+                                            None
+                                        };
 
                                     // 如果是键盘，创建 LED 控制通道
                                     if device_type == DeviceType::Keyboard {
@@ -192,11 +355,10 @@ impl InputManager {
                                     let active_monitors_clone = Arc::clone(&active_monitors);
 
                                     tokio::spawn(async move {
-                                        let monitor = DeviceMonitor {
+                                        let monitor = DeviceMonitor::new(
                                             device_type,
-                                            keyboard_state: KeyboardState::default(),
-                                            mouse_state: MouseState::default(),
-                                        };
+                                            rate_controller_for_device,
+                                        );
 
                                         info!("Started monitoring: {}", path_id);
                                         monitor.run(tx_clone, led_rx_to_pass, device).await;
@@ -248,6 +410,14 @@ impl InputManager {
 }
 
 impl DeviceMonitor {
+    fn new(device_type: DeviceType, rate_controller: Option<MouseRateController>) -> Self {
+        Self {
+            device_type,
+            keyboard_state: KeyboardState::default(),
+            mouse_state: MouseState::new(rate_controller.unwrap_or_default()),
+        }
+    }
+
     async fn run(
         mut self,
         tx: mpsc::UnboundedSender<InputReport>,
@@ -464,64 +634,51 @@ impl DeviceMonitor {
     }
 
     fn process_mouse_event(&mut self, event: evdev::InputEvent) -> Option<InputReport> {
-        let axis = evdev::RelativeAxisCode(event.code());
-
         match event.event_type() {
             EventType::KEY => {
                 let key = KeyCode::new(event.code());
                 let is_pressed = event.value() == 1;
 
-                match key {
-                    KeyCode::BTN_LEFT => {
-                        if is_pressed {
-                            self.mouse_state.buttons |= 0x01;
-                        } else {
-                            self.mouse_state.buttons &= !0x01;
-                        }
-                    }
-                    KeyCode::BTN_RIGHT => {
-                        if is_pressed {
-                            self.mouse_state.buttons |= 0x02;
-                        } else {
-                            self.mouse_state.buttons &= !0x02;
-                        }
-                    }
-                    KeyCode::BTN_MIDDLE => {
-                        if is_pressed {
-                            self.mouse_state.buttons |= 0x04;
-                        } else {
-                            self.mouse_state.buttons &= !0x04;
-                        }
-                    }
+                let button_bit = match key {
+                    KeyCode::BTN_LEFT => 0x01,
+                    KeyCode::BTN_RIGHT => 0x02,
+                    KeyCode::BTN_MIDDLE => 0x04,
+                    KeyCode::BTN_SIDE => 0x08,  // 侧键1
+                    KeyCode::BTN_EXTRA => 0x10, // 侧键2
                     _ => return None,
+                };
+
+                if is_pressed {
+                    self.mouse_state.buttons |= button_bit;
+                } else {
+                    self.mouse_state.buttons &= !button_bit;
                 }
-                // 按钮变化需要标记，但也等 SYN_REPORT 一起发
                 self.mouse_state.dirty = true;
+                self.mouse_state.button_changed = true;
             }
 
             EventType::RELATIVE => {
+                let axis = evdev::RelativeAxisCode(event.code());
                 match axis {
                     evdev::RelativeAxisCode::REL_X => {
-                        self.mouse_state.x_delta += event.value() as i16;
+                        self.mouse_state.accumulate_x(event.value());
                     }
                     evdev::RelativeAxisCode::REL_Y => {
-                        self.mouse_state.y_delta += event.value() as i16;
+                        self.mouse_state.accumulate_y(event.value());
                     }
                     evdev::RelativeAxisCode::REL_WHEEL => {
-                        self.mouse_state.wheel_delta += event.value() as i8;
+                        self.mouse_state.accumulate_wheel(event.value());
+                    }
+                    evdev::RelativeAxisCode::REL_HWHEEL => {
+                        // 水平滚轮，如需支持可扩展
                     }
                     _ => return None,
                 }
-                self.mouse_state.dirty = true;
             }
 
-            // 只在 SYN_REPORT 时发送完整报告
             EventType::SYNCHRONIZATION => {
-                if self.mouse_state.dirty {
-                    // record_syn_rate();
-                    // elapsed_since_last_call_ms();
-                    self.mouse_state.dirty = false;
-                    return Some(self.build_mouse_report());
+                if self.mouse_state.dirty && self.mouse_state.should_send_report() {
+                    return Some(self.mouse_state.build_report());
                 }
             }
 
@@ -529,22 +686,6 @@ impl DeviceMonitor {
         }
 
         None
-    }
-
-    fn build_mouse_report(&mut self) -> InputReport {
-        let report = InputReport::Mouse {
-            buttons: self.mouse_state.buttons,
-            x: self.mouse_state.x_delta,
-            y: self.mouse_state.y_delta,
-            wheel: self.mouse_state.wheel_delta,
-        };
-
-        // ⭐发完立刻清空 delta
-        self.mouse_state.x_delta = 0;
-        self.mouse_state.y_delta = 0;
-        self.mouse_state.wheel_delta = 0;
-
-        report
     }
 }
 
@@ -674,7 +815,7 @@ mod tests {
     #[ignore]
     async fn test_input_manager() {
         info!("Starting InputManager test. Please provide keyboard/mouse input...");
-        let mut manager = InputManager::new();
+        let mut manager = InputManager::new(0);
 
         while let Some(report) = manager.next_event().await {
             debug!("Input report: {:?}", report);
@@ -685,7 +826,7 @@ mod tests {
     #[ignore]
     async fn test_set_all_leds() {
         info!("Starting LED control test. Please observe keyboard LEDs...");
-        let mut manager = InputManager::new();
+        let mut manager = InputManager::new(0);
         let led_state_1 = LedState {
             num_lock: true,
             caps_lock: false,

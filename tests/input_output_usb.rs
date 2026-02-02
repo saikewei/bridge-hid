@@ -4,9 +4,9 @@ use bridge_hid::output::usb::{self, build_usb_hid_device};
 use bridge_hid::output::{self, HidLedReader, HidReportSender, LedState};
 use evdev::InputEvent;
 use glob;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14,11 +14,13 @@ use tokio::sync::Mutex;
 async fn test_usb_input_output() {
     init();
     println!("Starting USB input-output test...");
-    let mut manager = InputManager::new();
+    let mut manager = InputManager::new(500);
     let mut led_handle = manager.led_handle.take().unwrap();
 
     let (mut kb_hid_device, mut kb_hid_device_clone, mut mouse_hid_device) =
         build_usb_hid_device().await.expect("创建 USB HID 设备失败");
+
+    let mouse_rate_controller = manager.mouse_rate_controller.clone();
 
     // std::thread::sleep(std::time::Duration::from_secs(2));
 
@@ -60,8 +62,19 @@ async fn test_usb_input_output() {
         }
     });
 
+    let control_handle = tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        println!("Changing mouse report rate to 1000Hz");
+        mouse_rate_controller.set_rate(1000);
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        println!("Changing mouse report rate to 500Hz");
+        mouse_rate_controller.set_rate(500);
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    });
+
     tokio::select! {
         _ = main_handle => {},
         _ = led_handle => {},
+        _ = control_handle => {},
     }
 }
