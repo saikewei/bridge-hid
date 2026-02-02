@@ -406,6 +406,12 @@ impl InputManager {
     pub async fn next_event(&mut self) -> Option<InputReport> {
         self.event_rx.recv().await
     }
+
+    pub async fn clear_events(&mut self) {
+        while let Ok(report) = self.event_rx.try_recv() {
+            debug!("Cleared event: {:?}", report);
+        }
+    }
 }
 
 impl DeviceMonitor {
