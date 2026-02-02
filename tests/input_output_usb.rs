@@ -1,4 +1,5 @@
 use bridge_hid::input::{self, InputManager};
+use bridge_hid::logging::init;
 use bridge_hid::output::usb::{self, build_usb_hid_device};
 use bridge_hid::output::{self, HidLedReader, HidReportSender, LedState};
 use evdev::InputEvent;
@@ -11,6 +12,7 @@ use tokio::sync::Mutex;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn test_usb_input_output() {
+    init();
     println!("Starting USB input-output test...");
     let mut manager = InputManager::new();
     let mut led_handle = manager.led_handle.take().unwrap();

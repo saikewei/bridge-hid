@@ -1,5 +1,7 @@
 use crate::output::LedState;
+use anyhow::Context;
 use evdev::{Device, EventType, InputEvent, KeyCode};
+use log::{debug, error, info, trace, warn};
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -41,7 +43,7 @@ fn record_syn_rate() {
 
     if last.elapsed() >= Duration::from_secs(1) {
         let count = SYN_COUNT.swap(0, Ordering::Relaxed);
-        println!("SYN_REPORT rate = {}", count);
+        trace!("SYN_REPORT rate = {}", count);
         *last = Instant::now();
     }
 }
@@ -60,7 +62,7 @@ fn elapsed_since_last_call_ms() {
     *last = Instant::now();
 
     if elapsed > 10 {
-        println!(
+        warn!(
             "Warning: Long delay between SYN_REPORT events: {} ms",
             elapsed
         );
@@ -124,11 +126,10 @@ impl InputManager {
 
         // 启动设备扫描和监控
         tokio::spawn(async move {
-            // --- 修改点：传入 keyboard_controls_clone ---
             if let Err(e) =
                 Self::monitor_devices(event_tx, keyboard_controls, current_led_state).await
             {
-                eprintln!("Monitor Devices task failed: {:?}", e);
+                error!("Monitor Devices task failed: {}", e);
             }
         });
 
@@ -142,7 +143,7 @@ impl InputManager {
         tx: mpsc::UnboundedSender<InputReport>,
         keyboard_controls: Arc<Mutex<Vec<mpsc::UnboundedSender<LedState>>>>,
         current_led_state: Arc<Mutex<LedState>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<()> {
         use tokio::time::{Duration, sleep};
         let active_monitors = Arc::new(Mutex::new(HashSet::<String>::new()));
 
@@ -168,7 +169,7 @@ impl InputManager {
 
                                     // 如果是键盘，创建 LED 控制通道
                                     if device_type == DeviceType::Keyboard {
-                                        device.grab().expect("独占失败！");
+                                        device.grab().context("独占键盘设备失败")?;
                                         let (led_tx, led_rx) =
                                             mpsc::unbounded_channel::<LedState>();
                                         // 将 tx 存入全局列表，以便 InputManager::set_all_leds 广播
@@ -182,7 +183,7 @@ impl InputManager {
                                                 .unwrap_or_default(),
                                         );
 
-                                        println!(
+                                        debug!(
                                             "current_led_state_clone: {:?}",
                                             current_led_state_clone
                                         );
@@ -197,12 +198,11 @@ impl InputManager {
                                             mouse_state: MouseState::default(),
                                         };
 
-                                        println!("Started monitoring: {}", path_id);
+                                        info!("Started monitoring: {}", path_id);
                                         monitor.run(tx_clone, led_rx_to_pass, device).await;
 
-                                        // 线程退出（报错或断开）后清理占位符
                                         active_monitors_clone.lock().unwrap().remove(&path_id);
-                                        println!("Stopped monitoring: {}", path_id);
+                                        info!("Stopped monitoring: {}", path_id);
                                     });
 
                                     // 发送当前 LED 状态以同步新连接的键盘
@@ -259,24 +259,23 @@ impl DeviceMonitor {
             .name()
             .map(|n| n.to_string())
             .unwrap_or_else(|| "Unknown".to_string());
+        debug!("Device name: {}", device_name);
 
-        // 只有当设备类型是键盘时，才启用 LED 控制逻辑和 FD 克隆
         if self.device_type == DeviceType::Keyboard {
-            // 1. 获取底层的系统文件描述符 (Raw FD)
             let raw_fd = device.as_raw_fd();
 
-            // 2. 使用系统调用 dup 克隆描述符
             let cloned_fd = unsafe { libc::dup(raw_fd) };
-            println!("Cloned FD: {}", cloned_fd);
+            debug!("Cloned FD: {}", cloned_fd);
             if cloned_fd < 0 {
-                eprintln!("系统调用 dup 失败");
+                error!("系统调用 dup 失败");
                 return;
             }
 
             let fd_path = format!("/proc/self/fd/{}", cloned_fd);
-            match Device::open(&fd_path) {
+            match Device::open(&fd_path)
+                .with_context(|| format!("打开克隆 FD 设备失败: {}", fd_path))
+            {
                 Ok(mut write_device) => {
-                    // 3. 任务一：异步 LED 写入任务
                     led_handle = Some(tokio::spawn(async move {
                         if let Some(mut rx) = led_rx {
                             while let Some(ctrl) = rx.recv().await {
@@ -309,7 +308,7 @@ impl DeviceMonitor {
                                 ];
 
                                 if let Err(e) = write_device.send_events(&events) {
-                                    eprintln!("发送 LED 批量事件失败: {}", e);
+                                    error!("发送 LED 批量事件失败: {}", e);
                                     break;
                                 }
                             }
@@ -317,14 +316,12 @@ impl DeviceMonitor {
                     }));
                 }
                 Err(e) => {
-                    eprintln!("通过克隆的 FD 创建新 Device 失败: {}", e);
+                    error!("通过克隆的 FD 创建新 Device 失败: {}", e);
                     unsafe { libc::close(cloned_fd) };
-                    // 即使 LED 辅助设备创建失败，我们通常也希望继续运行读取任务
                 }
             }
         }
 
-        // 任务二：读取任务 (无论是键盘还是鼠标都需要运行)
         let fetch_handle = tokio::task::spawn_blocking(move || {
             loop {
                 match device.fetch_events() {
@@ -338,7 +335,7 @@ impl DeviceMonitor {
                         }
                     }
                     Err(e) => {
-                        eprintln!("读取事件失败: {}", e);
+                        error!("读取事件失败: {}", e);
                         return;
                     }
                 }
@@ -676,18 +673,18 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_input_manager() {
-        println!("Starting InputManager test. Please provide keyboard/mouse input...");
+        info!("Starting InputManager test. Please provide keyboard/mouse input...");
         let mut manager = InputManager::new();
 
         while let Some(report) = manager.next_event().await {
-            println!("Input report: {:?}", report);
+            debug!("Input report: {:?}", report);
         }
     }
 
     #[tokio::test]
     #[ignore]
     async fn test_set_all_leds() {
-        println!("Starting LED control test. Please observe keyboard LEDs...");
+        info!("Starting LED control test. Please observe keyboard LEDs...");
         let mut manager = InputManager::new();
         let led_state_1 = LedState {
             num_lock: true,
@@ -712,6 +709,6 @@ mod tests {
             led_handle.set_leds(&led_state_2).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
-        println!("Sent LED state to all keyboards.");
+        info!("Sent LED state to all keyboards.");
     }
 }
