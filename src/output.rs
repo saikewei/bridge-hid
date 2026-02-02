@@ -1,4 +1,3 @@
-pub mod bluetooth;
 pub mod bluetooth_ble;
 pub mod usb;
 
@@ -296,7 +295,5 @@ pub mod keycodes {
 }
 
 // 重新导出常用类型
-pub use bluetooth::BluetoothKeyboardHidDevice;
-pub use bluetooth::BluetoothMouseHidDevice;
 pub use usb::UsbKeyboardHidDevice;
 pub use usb::UsbMouseHidDevice;

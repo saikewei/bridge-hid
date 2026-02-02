@@ -4,8 +4,7 @@ use evdev::{Device, EventType, InputEvent, KeyCode};
 use log::{debug, error, info, trace, warn};
 use std::collections::HashSet;
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::path::PathBuf;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -421,7 +420,7 @@ impl DeviceMonitor {
     async fn run(
         mut self,
         tx: mpsc::UnboundedSender<InputReport>,
-        mut led_rx: Option<mpsc::UnboundedReceiver<LedState>>,
+        led_rx: Option<mpsc::UnboundedReceiver<LedState>>,
         mut device: Device,
     ) {
         let mut led_handle = None;

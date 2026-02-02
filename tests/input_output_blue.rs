@@ -1,12 +1,7 @@
 use bridge_hid::input::{self, InputManager};
 use bridge_hid::logging::init;
-use bridge_hid::output::bluetooth_ble::{
-    BluetoothBleKeyboardHidDevice, BluetoothBleMouseHidDevice, build_ble_hid_device, run_ble_server,
-};
-use bridge_hid::output::{self, HidLedReader, HidReportSender};
-use std::sync::Arc;
-use tokio::io::AsyncReadExt;
-use tokio::sync::Mutex;
+use bridge_hid::output::HidReportSender;
+use bridge_hid::output::bluetooth_ble::{build_ble_hid_device, run_ble_server};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]

@@ -5,7 +5,7 @@ use bluer::agent::Agent;
 use bluer::gatt::local::{
     Application, Characteristic, CharacteristicNotify, CharacteristicNotifyMethod,
     CharacteristicRead, CharacteristicWrite, CharacteristicWriteMethod, Descriptor, DescriptorRead,
-    DescriptorWrite, Service,
+    Service,
 };
 use bluer::{Adapter, Uuid};
 use futures::FutureExt;

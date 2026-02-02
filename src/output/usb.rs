@@ -2,9 +2,7 @@ use anyhow::{Context, Ok, Result, anyhow};
 use async_trait::async_trait;
 use glob;
 use log::{debug, error, info, warn};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::File as TokioFile;
@@ -15,7 +13,7 @@ use usb_gadget::{Class, Config, Gadget, Id, Strings, default_udc, function::hid:
 use crate::output::InputReport;
 use crate::output::{HidLedReader, HidReportSender};
 
-use super::{KeyboardHidDevice, KeyboardModifiers, LedState, MouseButtons, MouseHidDevice};
+use super::LedState;
 
 /// 键盘 HID 报告描述符
 const KEYBOARD_REPORT_DESC: &[u8] = &[
@@ -201,8 +199,6 @@ pub async fn build_usb_hid_device() -> Result<(
 
 /// 等待 USB HID 设备被主机枚举
 pub async fn wait_for_enumeration(timeout_secs: u64) -> anyhow::Result<()> {
-    let udc_state_path = "/sys/class/udc/*/state";
-
     timeout(Duration::from_secs(timeout_secs), async {
         loop {
             // 查找 UDC 状态文件
