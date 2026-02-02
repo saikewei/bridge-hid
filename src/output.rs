@@ -1,4 +1,5 @@
 pub mod bluetooth;
+pub mod bluetooth_ble;
 pub mod usb;
 
 use crate::input::InputReport;
