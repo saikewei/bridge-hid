@@ -12,7 +12,7 @@ use futures::FutureExt;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
-use super::{HidLedReader, HidReportSender, InputReport, LedState};
+use super::{HidReportSender, InputReport, LedState};
 
 macro_rules! ble_uuid {
     ($short:expr) => {
@@ -145,9 +145,8 @@ pub async fn build_ble_hid_device() -> Result<(
 
     // 配置适配器
     adapter.set_powered(true).await?;
-    adapter.set_alias("BLE Keyboard".to_string()).await?;
-    adapter.set_discoverable(true).await?;
-    adapter.set_discoverable_timeout(0).await?;
+    adapter.set_alias("BLE Keyboard111".to_string()).await?;
+    adapter.set_discoverable(false).await?;
     adapter.set_pairable(true).await?;
     adapter.set_pairable_timeout(0).await?;
 
@@ -610,13 +609,6 @@ impl HidReportSender for BluetoothBleMouseHidDevice {
             }
         }
         Ok(())
-    }
-}
-
-#[async_trait]
-impl HidLedReader for BluetoothBleKeyboardHidDevice {
-    async fn get_led_state(&mut self) -> Result<Option<LedState>> {
-        Ok(None)
     }
 }
 

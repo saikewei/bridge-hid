@@ -128,87 +128,12 @@ pub trait HidLedReader: Send + Sync {
     async fn get_led_state(&mut self) -> Result<Option<LedState>>;
 }
 
-/// 该 trait 定义了键盘和鼠标的通用操作，
-pub trait KeyboardHidDevice {
-    // ========== 键盘操作 ==========
+pub struct NoLedDevice;
 
-    /// 按下键盘按键
-    fn key_press(&mut self, keycode: u8) -> Result<()>;
-
-    /// 释放键盘按键
-    fn key_release(&mut self, keycode: u8) -> Result<()>;
-
-    /// 按下并释放按键（点击）
-    fn key_tap(&mut self, keycode: u8) -> Result<()> {
-        self.key_press(keycode)?;
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        self.key_release(keycode)
-    }
-
-    /// 设置修饰键状态
-    fn set_modifiers(&mut self, modifiers: KeyboardModifiers) -> Result<()>;
-
-    /// 释放所有按键
-    fn release_all_keys(&mut self) -> Result<()>;
-
-    /// 输入字符串（仅支持基本 ASCII）
-    fn type_string(&mut self, s: &str) -> Result<()> {
-        for c in s.chars() {
-            if let Some((keycode, shift)) = char_to_keycode(c) {
-                if shift {
-                    self.set_modifiers(KeyboardModifiers {
-                        left_shift: true,
-                        ..Default::default()
-                    })?;
-                }
-                self.key_tap(keycode)?;
-                if shift {
-                    self.set_modifiers(KeyboardModifiers::default())?;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-        Ok(())
-    }
-
-    /// 读取 LED 状态（如大写锁定等）
-    fn read_led_state(&self) -> Result<Option<LedState>>;
-}
-
-pub trait MouseHidDevice {
-    // ========== 鼠标操作 ==========
-
-    /// 移动鼠标（相对移动）
-    fn mouse_move(&mut self, x: i8, y: i8) -> Result<()>;
-
-    /// 按下鼠标按钮
-    fn mouse_button_press(&mut self, buttons: MouseButtons) -> Result<()>;
-
-    /// 释放鼠标按钮
-    fn mouse_button_release(&mut self) -> Result<()>;
-
-    /// 鼠标点击
-    fn mouse_click(&mut self, button: MouseButtons) -> Result<()> {
-        self.mouse_button_press(button)?;
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        self.mouse_button_release()
-    }
-
-    /// 鼠标滚轮
-    fn mouse_scroll(&mut self, delta: i8) -> Result<()>;
-}
-
-/// 将字符转换为键码，返回 (keycode, need_shift)
-fn char_to_keycode(c: char) -> Option<(u8, bool)> {
-    match c {
-        'a'..='z' => Some((keycodes::KEY_A + (c as u8 - b'a'), false)),
-        'A'..='Z' => Some((keycodes::KEY_A + (c as u8 - b'A'), true)),
-        '1'..='9' => Some((keycodes::KEY_1 + (c as u8 - b'1'), false)),
-        '0' => Some((keycodes::KEY_0, false)),
-        ' ' => Some((keycodes::KEY_SPACE, false)),
-        '\n' => Some((keycodes::KEY_ENTER, false)),
-        '\t' => Some((keycodes::KEY_TAB, false)),
-        _ => None,
+#[async_trait]
+impl HidLedReader for NoLedDevice {
+    async fn get_led_state(&mut self) -> Result<Option<LedState>> {
+        Ok(Some(LedState::default()))
     }
 }
 

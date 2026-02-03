@@ -544,7 +544,8 @@ impl DeviceMonitor {
 
     fn process_keyboard_event(&mut self, event: evdev::InputEvent) -> Option<InputReport> {
         if event.event_type() == EventType::KEY {
-            let key = KeyCode::new(event.code()); // 将原始 code 转换为 Key 枚举
+            let key = KeyCode::new(event.code());
+            debug!("raw key: {:?}, code={}", key, event.code()); // 将原始 code 转换为 Key 枚举
             let value = event.value();
 
             if value == 2 {
@@ -770,6 +771,20 @@ fn evdev_to_hid(code: KeyCode) -> Option<u8> {
         KeyCode::KEY_F10 => 0x43,
         KeyCode::KEY_F11 => 0x44,
         KeyCode::KEY_F12 => 0x45,
+
+        // ----- 兼容 Fn 层（将多媒体键映射到 F1~F12） -----
+        KeyCode::KEY_BRIGHTNESSDOWN => 0x3A, // F1
+        KeyCode::KEY_BRIGHTNESSUP => 0x3B,   // F2
+        KeyCode::KEY_SCALE => 0x3C,          // F3
+        KeyCode::KEY_DASHBOARD => 0x3D,      // F4
+        KeyCode::KEY_KBDILLUMDOWN => 0x3E,   // F5
+        KeyCode::KEY_KBDILLUMUP => 0x3F,     // F6
+        KeyCode::KEY_PREVIOUSSONG => 0x40,   // F7
+        KeyCode::KEY_PLAYPAUSE => 0x41,      // F8
+        KeyCode::KEY_NEXTSONG => 0x42,       // F9
+        KeyCode::KEY_MUTE => 0x43,           // F10
+        KeyCode::KEY_VOLUMEDOWN => 0x44,     // F11
+        KeyCode::KEY_VOLUMEUP => 0x45,       // F12
 
         // ----- 功能区 -----
         KeyCode::KEY_SYSRQ | KeyCode::KEY_PRINT => 0x46, // PrintScreen
