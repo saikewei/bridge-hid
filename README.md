@@ -10,7 +10,7 @@ Bridge HID is a high-performance HID (Keyboard/Mouse) switcher implemented in Ru
 
 ### Features
 - **Dual Output**: Seamlessly switch between USB wired connection and Bluetooth BLE connection.
-- **Low Latency**: Optimized event processing for gaming and professional use.
+- **Low Latency**: Optimized event processing.
 - **Auto-Sync**: Synchronizes Keyboard LED states (NumLock, CapsLock) across devices.
 - **Raspberry Pi Optimized**: Designed to run on Raspberry Pi Zero / 4 / 5 using the USB gadget mode.
 
@@ -56,7 +56,7 @@ Bridge HID 是一个基于 Rust 开发的高性能 HID（键鼠）切换器。�
 
 ### 功能特性
 - **双模输出**: 在 USB 有线连接与蓝牙 BLE 连接之间无缝切换。
-- **低延迟**: 针对输入操作进行了优化，适用于办公及游戏场景。
+- **低延迟**: 针对输入操作进行了优化，自动适应输入鼠标的回报率。
 - **状态同步**: 自动同步不同主机间的键盘 LED 状态（如大写锁定、数字键盘锁）。
 - **树莓派优化**: 专门针对支持 USB Gadget 模式的树莓派（如 Zero, 4, 5）设计。
 
