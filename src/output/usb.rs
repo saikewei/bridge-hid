@@ -2,6 +2,8 @@ use anyhow::{Context, Ok, Result, anyhow};
 use async_trait::async_trait;
 use glob;
 use log::{debug, error, info, warn};
+use std::error::Error as StdError;
+use std::fmt;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -85,6 +87,17 @@ const MOUSE_REPORT_DESC: &[u8] = &[
     0xC0, //   End Collection
     0xC0, // End Collection
 ];
+
+#[derive(Debug, Clone)]
+struct UsbError(String);
+
+impl fmt::Display for UsbError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "USB Gadgets 错误: {}", self.0)
+    }
+}
+
+impl StdError for UsbError {}
 
 /// USB HID 键盘鼠标模拟器
 pub struct UsbKeyboardHidDevice {
@@ -242,7 +255,7 @@ impl HidReportSender for UsbKeyboardHidDevice {
                 if let Some(ref mut file) = self.keyboard_file {
                     file.write_all(&data)
                         .await
-                        .context("异步发送键盘报告失败")?;
+                        .map_err(|e| UsbError(format!("异步发送键盘报告失败: {}", e)))?;
                     // file.flush().await?;
                 }
             }
@@ -300,7 +313,7 @@ impl HidReportSender for UsbMouseHidDevice {
                 if let Some(ref mut file) = self.mouse_file {
                     file.write_all(&data)
                         .await
-                        .context("异步发送鼠标报告失败")?;
+                        .map_err(|e| UsbError(format!("异步发送鼠标报告失败: {}", e)))?;
 
                     // file.flush().await?;
                 }

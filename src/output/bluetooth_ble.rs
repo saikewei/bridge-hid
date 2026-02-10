@@ -9,8 +9,21 @@ use bluer::gatt::local::{
 };
 use bluer::{Adapter, Uuid};
 use futures::FutureExt;
+use std::error::Error as StdError;
+use std::fmt;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
+
+#[derive(Debug, Clone)]
+struct BleError(String);
+
+impl fmt::Display for BleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "蓝牙错误: {}", self.0)
+    }
+}
+
+impl StdError for BleError {}
 
 use super::{HidReportSender, InputReport, LedState};
 
@@ -560,12 +573,11 @@ impl HidReportSender for BluetoothBleKeyboardHidDevice {
                     hid_report.push(*keys.get(i).unwrap_or(&0x00));
                 }
 
-                // log::info!("发送键盘报告: {:02X?}", hid_report);
                 tx.send(hid_report)
                     .await
-                    .map_err(|e| anyhow!("发送键盘报告失败: {}", e))?;
+                    .map_err(|e| BleError(format!("发送报告失败: {}", e)))?;
             } else {
-                log::warn!("键盘通知器未就绪");
+                return Err(BleError("通知器未就绪".to_string()).into());
             }
         }
         Ok(())
@@ -603,9 +615,9 @@ impl HidReportSender for BluetoothBleMouseHidDevice {
                 // log::info!("发送鼠标报告: {:02X?}", hid_report);
                 tx.send(hid_report)
                     .await
-                    .map_err(|e| anyhow!("发送鼠标报告失败: {}", e))?;
+                    .map_err(|e| BleError(format!("发送报告失败: {}", e)))?;
             } else {
-                log::warn!("鼠标通知器未就绪");
+                return Err(BleError("通知器未就绪".to_string()).into());
             }
         }
         Ok(())
