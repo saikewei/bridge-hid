@@ -1,5 +1,6 @@
 use bridge_hid::core;
 use bridge_hid::logging::init;
+use bridge_hid::web;
 use clap::{Parser, ValueEnum};
 use log::{debug, info};
 
@@ -38,6 +39,10 @@ async fn run_switcher() -> anyhow::Result<()> {
 }
 
 async fn run_web_touchpad() -> anyhow::Result<()> {
-    info!("Web Touchpad mode is not yet implemented.");
+    let app = web::router::build_router();
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    println!("listening on http://0.0.0.0:3000");
+    axum::serve(listener, app).await.unwrap();
     Ok(())
 }
