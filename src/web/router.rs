@@ -3,8 +3,8 @@ use axum::{Router, routing::get};
 use std::sync::Arc;
 use tower_http::services::ServeDir;
 
-pub fn build_router() -> Router {
-    let ws_state = Arc::new(ws::WsState::new());
+pub async fn build_router() -> Router {
+    let ws_state = Arc::new(ws::WsState::new().await);
 
     Router::new()
         .route("/ws", get(ws::ws_handler))

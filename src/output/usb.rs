@@ -89,7 +89,7 @@ const MOUSE_REPORT_DESC: &[u8] = &[
 ];
 
 #[derive(Debug, Clone)]
-struct UsbError(String);
+pub struct UsbError(String);
 
 impl fmt::Display for UsbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

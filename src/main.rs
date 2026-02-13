@@ -39,7 +39,7 @@ async fn run_switcher() -> anyhow::Result<()> {
 }
 
 async fn run_web_touchpad() -> anyhow::Result<()> {
-    let app = web::router::build_router();
+    let app = web::router::build_router().await;
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     println!("listening on http://0.0.0.0:3000");
