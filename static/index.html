@@ -1,12 +1,26 @@
-<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Test Index</title>
-  </head>
-  <body>
-    <h1>Index Page</h1>
-    <p>Hello from static index.html</p>
-    <a href="/static/test.html">Go to test.html</a>
-  </body>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Rust Remote Touchpad</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="status-bar" class="disconnected">🔴 未连接</div>
+
+    <div id="touch-zone">
+        <div class="hint">在此区域滑动控制鼠标</div>
+    </div>
+
+    <div id="control-bar">
+        <button id="btn-left" class="mouse-btn">左键</button>
+        <button id="btn-keyboard" class="tool-btn">⌨️</button>
+        <button id="btn-right" class="mouse-btn">右键</button>
+    </div>
+
+    <input type="text" id="hidden-input" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+
+    <script src="main.js"></script>
+</body>
 </html>
