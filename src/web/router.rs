@@ -1,12 +1,13 @@
 use crate::web::ws;
 use axum::{Router, routing::get};
+use std::sync::Arc;
 use tower_http::services::ServeDir;
 
 pub fn build_router() -> Router {
-    let router = Router::new()
-        // .route("/api/hello", get(hello_handler))
-        .route("/ws", get(ws::ws_handler))
-        .fallback_service(ServeDir::new("static"));
+    let ws_state = Arc::new(ws::WsState::new());
 
-    return router;
+    Router::new()
+        .route("/ws", get(ws::ws_handler))
+        .with_state(ws_state)
+        .fallback_service(ServeDir::new("static"))
 }
